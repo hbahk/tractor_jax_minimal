@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
+import jax.image
 from jax import vmap
 
 from tractor.miscutils import lanczos_filter, batch_correlate1d
@@ -212,18 +213,37 @@ def render_pixelized_psf(psf_img, dx, dy):
     return outimg[0]
 
 
-def downsample_image(img, factor):
+def downsample_image(img, target_shape):
     """
-    Downsamples image by integer factor using sum (flux conservation).
-    img: (H*factor, W*factor)
-    Returns: (H, W)
+    Downsamples image to target_shape using Lanczos3 interpolation.
+    Conserves total flux by scaling the result.
+
+    Args:
+        img: (H_hr, W_hr) image
+        target_shape: (H, W) tuple
+
+    Returns:
+        (H, W) image
     """
     H_hr, W_hr = img.shape
-    H = H_hr // factor
-    W = W_hr // factor
-    # Reshape and sum
-    # (H, factor, W, factor) -> sum axis 1, 3
-    return img.reshape(H, factor, W, factor).sum(axis=(1, 3))
+    H, W = target_shape
+
+    # Calculate scale factors
+    scale_y = H_hr / H
+    scale_x = W_hr / W
+
+    # Resize using jax.image.resize
+    # We use "lanczos3" as requested.
+    out = jax.image.resize(img, target_shape, method='lanczos3')
+
+    # Flux conservation:
+    # If we downsample, the new pixel area is (scale_y * scale_x) times the old pixel area.
+    # jax.image.resize interpolates intensity. To preserve total flux,
+    # we need to multiply by the ratio of areas.
+    # (Or effectively, we are integrating over a larger area).
+    out = out * (scale_y * scale_x)
+
+    return out
 
 
 def render_galaxy_fft(
@@ -233,7 +253,6 @@ def render_galaxy_fft(
     wcs_cd_inv,
     subpixel_offset,
     image_shape,
-    sampling=1.0,
 ):
     """
     Renders a galaxy using FFT convolution.
@@ -241,12 +260,10 @@ def render_galaxy_fft(
     Args:
         galaxy_mix: (amp, mean, var) of the galaxy profile (normalized, unsheared).
         psf_fft: (H, W) Complex Fourier Transform of the PSF.
-                 If sampling != 1, this should be the FFT of the oversampled PSF.
         shape_params: (re, ab, phi)
         wcs_cd_inv: (2, 2) Inverse CD matrix
         subpixel_offset: (x, y)
         image_shape: (H, W) target image shape (data pixels)
-        sampling: float. Over-sampling factor (>=1.0).
 
     Returns:
         Rendered image (H, W)
@@ -255,28 +272,6 @@ def render_galaxy_fft(
     re, ab, phi = shape_params
     pos_x, pos_y = subpixel_offset
     H, W = image_shape
-
-    # Handle Oversampling
-    if sampling > 1.0:
-        factor = int(round(sampling))
-        # Ensure factor is valid (assuming integer oversampling for now)
-        H_fft = H * factor
-        W_fft = W * factor
-
-        # Scale inputs to high-res
-        # CD inv: degrees -> pixels. High res has 'factor' times more pixels per degree.
-        wcs_cd_inv = wcs_cd_inv * sampling
-
-        # Position: data pixels -> high res pixels
-        # Add offset to align pixel centers.
-        # Low res pixel 0 center maps to High res pixel center of the first block.
-        # Center of first block (0..F-1) is (F-1)/2.0.
-        # pos_hr = pos_lr * factor + (factor - 1) / 2.0
-        pos_x = pos_x * sampling + (factor - 1) / 2.0
-        pos_y = pos_y * sampling + (factor - 1) / 2.0
-    else:
-        H_fft = H
-        W_fft = W
 
     # 1. Compute shear matrix
     G = get_galaxy_shape_matrix(re, ab, phi)
@@ -289,8 +284,8 @@ def render_galaxy_fft(
     sheared_mean = jnp.zeros_like(mean)
 
     # 3. Compute FFT of galaxy profile
-    freq_x = jfft.rfftfreq(W_fft)
-    freq_y = jfft.fftfreq(H_fft)
+    freq_x = jfft.rfftfreq(W)
+    freq_y = jfft.fftfreq(H)
 
     # Meshgrid frequencies
     v_grid, w_grid = jnp.meshgrid(freq_x, freq_y)
@@ -302,16 +297,11 @@ def render_galaxy_fft(
     gal_fft = gaussian_fourier_transform(amp, sheared_var, shifted_mean, v_grid, w_grid)
 
     # 4. Multiply with PSF FFT
-    # psf_fft should be rfft2 format matching (H_fft, W_fft)
+    # psf_fft should be rfft2 format matching (H, W)
     convolved_fft = gal_fft * psf_fft
 
     # 5. Inverse FFT
-    img = jfft.irfft2(convolved_fft, s=(H_fft, W_fft))
-
-    # 6. Downsample if needed
-    if sampling > 1.0:
-        factor = int(round(sampling))
-        img = downsample_image(img, factor)
+    img = jfft.irfft2(convolved_fft, s=(H, W))
 
     return img
 
@@ -333,7 +323,7 @@ def render_point_source_pixelized(flux, subpixel_offset, psf_image):
     return flux * shifted_psf
 
 
-def render_point_source_fft(flux, pos, psf_fft, image_shape, sampling=1.0):
+def render_point_source_fft(flux, pos, psf_fft, image_shape):
     """
     Renders a point source using FFT convolution (phase shift).
 
@@ -342,33 +332,21 @@ def render_point_source_fft(flux, pos, psf_fft, image_shape, sampling=1.0):
         pos: (x, y) Position.
         psf_fft: (H, W) FFT of PSF (centered at 0 frequency).
         image_shape: (H, W).
-        sampling: float. Over-sampling factor (>=1.0).
 
     Returns:
         Rendered image (H, W).
     """
     H, W = image_shape
 
-    if sampling > 1.0:
-        factor = int(round(sampling))
-        H_fft = H * factor
-        W_fft = W * factor
-        # Shift position for alignment
-        pos_fft = pos * sampling + (factor - 1) / 2.0
-    else:
-        H_fft = H
-        W_fft = W
-        pos_fft = pos
-
     # Frequencies
-    freq_x = jfft.rfftfreq(W_fft)
-    freq_y = jfft.fftfreq(H_fft)
+    freq_x = jfft.rfftfreq(W)
+    freq_y = jfft.fftfreq(H)
 
     v, w = jnp.meshgrid(freq_x, freq_y)
 
     # Phase shift for position
     # exp(-2pi * i * (x*v + y*w))
-    phase = -2.0 * jnp.pi * 1j * (pos_fft[0] * v + pos_fft[1] * w)
+    phase = -2.0 * jnp.pi * 1j * (pos[0] * v + pos[1] * w)
     shift_fft = jnp.exp(phase)
 
     # Convolve: Multiply FFTs
@@ -376,12 +354,7 @@ def render_point_source_fft(flux, pos, psf_fft, image_shape, sampling=1.0):
     model_fft = flux * shift_fft * psf_fft
 
     # Inverse FFT
-    img = jfft.irfft2(model_fft, s=(H_fft, W_fft))
-
-    # Downsample
-    if sampling > 1.0:
-        factor = int(round(sampling))
-        img = downsample_image(img, factor)
+    img = jfft.irfft2(model_fft, s=(H, W))
 
     return img
 
