@@ -411,25 +411,43 @@ def optimize_fluxes(tractor_obj):
         return chi2
 
     # 4. Optimize
-    # Since it is forced photometry (linear), we could solve linear system.
-    # But user asked for optimizer. And we might want to extend to non-linear later.
-    # We use jax.scipy.optimize.minimize (BFGS)
+    # Use Matrix-Free Newton-CG for linear least squares.
+    # Since the problem is linear in fluxes, the loss is quadratic.
+    # We solve H * delta_x = -grad using CG.
 
-    # "Enable JAX optimization of tractor's point sources and galaxies... where the autodiff capability might be applied"
+    # 1. Compute Gradient
+    grad_fn = jax.grad(loss_fn)
+    grads = grad_fn(initial_fluxes)
 
-    loss_val_grad = value_and_grad(loss_fn)
+    # 2. Define Hessian-Vector Product (HVP)
+    # The Hessian of f(x) is the Jacobian of grad(f)(x).
+    # HVP(v) = J(grad_f)(x) * v
+    # In JAX, we can use jvp to compute forward-mode derivatives.
+    # jvp(fun, primals, tangents) -> (primals_out, tangents_out)
+    # where tangents_out is Jacobian * tangents.
 
-    # print(f"Initial Fluxes: {initial_fluxes}")
-    # loss_0, grad_0 = loss_val_grad(initial_fluxes)
-    # print(f"Initial Loss: {loss_0}")
-    # print(f"Initial Grad: {grad_0}")
+    def matvec(v):
+        # We compute H*v at the initial point (any point works for quadratic/linear problem)
+        # return jax.jvp(grad_fn, (initial_fluxes,), (v,))[1]
 
-    import jax.scipy.optimize
-    # Note: BFGS expects scalar function.
-    res = jax.scipy.optimize.minimize(loss_fn, initial_fluxes, method='BFGS')
+        # Alternatively, for linear least squares specifically:
+        # Loss = ||Ax - b||^2
+        # Grad = 2 A^T (Ax - b)
+        # Hessian = 2 A^T A
+        # H*v = 2 A^T (A * v)
+        # We can implement this using jvp on the residual function if we exposed it.
+        # But jvp on grad is generic and works.
+        return jax.jvp(grad_fn, (initial_fluxes,), (v,))[1]
 
-    optimized_fluxes = res.x
-    # print(f"Optimized Fluxes: {optimized_fluxes}")
+    # 3. Solve H * step = -grads using CG
+    # jax.scipy.sparse.linalg.cg(A, b, x0=None, tol=1e-05, atol=0.0, maxiter=None, M=None)
+    # A can be a function.
+
+    step, info = jax.scipy.sparse.linalg.cg(matvec, -grads, maxiter=50) # 50 steps usually enough for convergence
+
+    # 4. Apply Update
+    # For a purely quadratic function, one Newton step is exact.
+    optimized_fluxes = initial_fluxes + step
 
     # 5. Update Tractor object
     # Copy tractor object?
