@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
-from jax import jit, value_and_grad, vmap
+from jax import jit, value_and_grad, vmap, hessian
 import numpy as np
 from functools import partial
 import jax.image
@@ -503,7 +503,7 @@ def render_scene(fluxes, images_data, batches):
     return model_images
 
 
-def solve_fluxes_core(initial_fluxes, images_data, batches):
+def solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=False):
     """
     Pure JAX core optimization logic.
     Can be vmapped over batches of images/sources if data is stacked.
@@ -512,9 +512,11 @@ def solve_fluxes_core(initial_fluxes, images_data, batches):
         initial_fluxes: JAX array (N_flux,)
         images_data: list of dicts (for N_bands), each leaf is JAX array.
         batches: dict of batched source data (pytree leaves are JAX arrays).
+        return_variances: bool, if True, calculate and return variances.
 
     Returns:
         optimized_fluxes: JAX array (N_flux,)
+        variances: JAX array (N_flux,) (only if return_variances=True)
     """
 
     def loss_fn(fluxes):
@@ -537,26 +539,50 @@ def solve_fluxes_core(initial_fluxes, images_data, batches):
     step, info = jax.scipy.sparse.linalg.cg(matvec, -grads, maxiter=50)
 
     optimized_fluxes = initial_fluxes + step
+
+    if return_variances:
+        # Calculate Hessian H = \nabla^2 loss_fn
+        # Covariance C = 2 * H^-1
+
+        # Calculate full Hessian
+        H = hessian(loss_fn)(optimized_fluxes)
+
+        # Invert F = 0.5 * H => C = F^-1 = 2 * H^-1
+        try:
+            C = 2.0 * jnp.linalg.inv(H)
+            variances = jnp.diag(C)
+        except:
+             # Fallback regularization
+             C = 2.0 * jnp.linalg.inv(H + jnp.eye(H.shape[0]) * 1e-12)
+             variances = jnp.diag(C)
+
+        return optimized_fluxes, variances
+
     return optimized_fluxes
 
 
-def optimize_fluxes(tractor_obj, oversample_rendering=False):
+def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=False):
     """
     Optimizes fluxes for forced photometry using JAX.
 
     Args:
         tractor_obj: Tractor object with images and catalog.
         oversample_rendering: bool, if True use oversampled rendering for PixelizedPSF with sampling != 1.
+        return_variances: bool, if True, return variances of fluxes.
 
     Returns:
         New Tractor object with optimized fluxes.
+        (Optional) variances array if return_variances=True.
     """
     # 1. Precompute/Extract data
     images_data, batches, initial_fluxes = extract_model_data(tractor_obj, oversample_rendering=oversample_rendering)
 
     # 2. Run JAX Optimization Core
     # We use the pure function here.
-    optimized_fluxes = solve_fluxes_core(initial_fluxes, images_data, batches)
+    if return_variances:
+        optimized_fluxes, variances = solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=True)
+    else:
+        optimized_fluxes = solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=False)
 
     # 3. Update Tractor object
     optimized_fluxes_np = np.array(optimized_fluxes)
@@ -573,5 +599,8 @@ def optimize_fluxes(tractor_obj, oversample_rendering=False):
             new_flux = optimized_fluxes_np[flux_idx : flux_idx + n_flux]
             src.brightness.setParams(new_flux)
             flux_idx += n_flux
+
+    if return_variances:
+        return tractor_obj, np.array(variances)
 
     return tractor_obj
