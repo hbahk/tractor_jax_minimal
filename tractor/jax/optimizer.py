@@ -547,14 +547,16 @@ def solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=Fal
         # Calculate full Hessian
         H = hessian(loss_fn)(optimized_fluxes)
 
-        # Invert F = 0.5 * H => C = F^-1 = 2 * H^-1
-        try:
-            C = 2.0 * jnp.linalg.inv(H)
-            variances = jnp.diag(C)
-        except:
-             # Fallback regularization
-             C = 2.0 * jnp.linalg.inv(H + jnp.eye(H.shape[0]) * 1e-12)
-             variances = jnp.diag(C)
+        # Scalar Fisher (Diagonal approximation) as requested.
+        # F_ss = 0.5 * H_ss
+        # Variance = 1 / F_ss = 2.0 / H_ss
+
+        h_diag = jnp.diag(H)
+
+        # Avoid division by zero
+        h_diag = jnp.where(h_diag == 0, 1e-12, h_diag)
+
+        variances = 2.0 / h_diag
 
         return optimized_fluxes, variances
 
