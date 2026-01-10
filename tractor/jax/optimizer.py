@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
-from jax import jit, value_and_grad, vmap, hessian
+from jax import jit, value_and_grad, vmap
 import numpy as np
 from functools import partial
 import jax.image
@@ -503,6 +503,122 @@ def render_scene(fluxes, images_data, batches):
     return model_images
 
 
+def compute_fisher_diagonal(images_data, batches, n_flux):
+    """
+    Computes the diagonal of the Fisher Information Matrix.
+    F_ss = sum_pixels ( (dModel/dFlux_s)^2 * invvar )
+    This avoids computing the full Hessian.
+    """
+    fisher_diag = jnp.zeros(n_flux)
+
+    for img_idx, img_dat in enumerate(images_data):
+        # Determine output shape
+        if "data" in img_dat:
+            H, W = img_dat["data"].shape
+        elif "shape" in img_dat:
+            H, W = img_dat["shape"]
+        else:
+            raise ValueError("Cannot determine image shape")
+
+        invvar = img_dat["invvar"] # (H, W)
+
+        # 1. Point Sources
+        if "PointSource" in batches:
+            batch = batches["PointSource"]
+            pos_pix = batch["pos_pix"][:, img_idx, :] # (N_ps, 2)
+            f_idx = batch["flux_idx"]
+
+            # Unit fluxes for derivatives
+            N_ps = pos_pix.shape[0]
+            unit_fluxes = jnp.ones(N_ps)
+
+            psf_data = img_dat["psf"]
+            sampling = psf_data.get("sampling", 1.0)
+
+            stamps = None
+
+            if "fft" in psf_data:
+                psf_fft = psf_data["fft"]
+
+                if sampling > 1.0:
+                    factor = int(round(sampling))
+                    H_hr = H * factor
+                    W_hr = W * factor
+                    render_shape = (H_hr, W_hr)
+                    pos_pix_scaled = pos_pix * sampling + (sampling - 1.0) / 2.0
+                else:
+                    render_shape = (H, W)
+                    pos_pix_scaled = pos_pix
+
+                render_fn = vmap(partial(render_point_source_fft, image_shape=render_shape), in_axes=(0, 0, None))
+                stamps = render_fn(unit_fluxes, pos_pix_scaled, psf_fft) # (N_ps, H_r, W_r)
+
+            else:
+                # MoG
+                psf_mix = (psf_data["amp"], psf_data["mean"], psf_data["var"])
+                render_fn = vmap(partial(render_point_source_mog, image_shape=(H, W)), in_axes=(0, 0, None))
+                stamps = render_fn(unit_fluxes, pos_pix, psf_mix)
+
+            # Downsample if needed
+            if sampling > 1.0:
+                 # vmap downsample
+                 ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                 stamps = ds_fn(stamps)
+
+            # Compute contribution: sum(stamp^2 * invvar)
+            contrib = jnp.sum(stamps**2 * invvar[jnp.newaxis, :, :], axis=(1, 2))
+            fisher_diag = fisher_diag.at[f_idx].add(contrib)
+
+        # 2. Galaxies
+        if "Galaxy" in batches:
+            batch = batches["Galaxy"]
+            pos_pix = batch["pos_pix"][:, img_idx, :]
+            wcs_cd_inv = batch["wcs_cd_inv"][:, img_idx, :, :]
+            shapes = batch["shapes"]
+            profiles = batch["profile"]
+            f_idx = batch["flux_idx"]
+
+            psf_data = img_dat["psf"]
+            sampling = psf_data.get("sampling", 1.0)
+
+            stamps = None
+
+            if "fft" in psf_data:
+                psf_fft = psf_data["fft"]
+                if sampling > 1.0:
+                    factor = int(round(sampling))
+                    H_hr = H * factor
+                    W_hr = W * factor
+                    render_shape = (H_hr, W_hr)
+                    pos_pix_scaled = pos_pix * sampling + (sampling - 1.0) / 2.0
+                    wcs_cd_inv_scaled = wcs_cd_inv * sampling
+                else:
+                    render_shape = (H, W)
+                    pos_pix_scaled = pos_pix
+                    wcs_cd_inv_scaled = wcs_cd_inv
+
+                gal_mix = (profiles["amp"], profiles["mean"], profiles["var"])
+                render_fn = vmap(partial(render_galaxy_fft, image_shape=render_shape), in_axes=((0, 0, 0), None, 0, 0, 0))
+                stamps = render_fn(gal_mix, psf_fft, shapes, wcs_cd_inv_scaled, pos_pix_scaled)
+
+            else:
+                # MoG
+                psf_mix = (psf_data["amp"], psf_data["mean"], psf_data["var"])
+                gal_mix = (profiles["amp"], profiles["mean"], profiles["var"])
+                render_fn = vmap(partial(render_galaxy_mog, image_shape=(H, W)), in_axes=((0, 0, 0), None, 0, 0, 0))
+                stamps = render_fn(gal_mix, psf_mix, shapes, wcs_cd_inv, pos_pix)
+
+            # Downsample
+            if sampling > 1.0:
+                 ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                 stamps = ds_fn(stamps)
+
+            contrib = jnp.sum(stamps**2 * invvar[jnp.newaxis, :, :], axis=(1, 2))
+            fisher_diag = fisher_diag.at[f_idx].add(contrib)
+
+    return fisher_diag
+
+
 def solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=False):
     """
     Pure JAX core optimization logic.
@@ -541,22 +657,16 @@ def solve_fluxes_core(initial_fluxes, images_data, batches, return_variances=Fal
     optimized_fluxes = initial_fluxes + step
 
     if return_variances:
-        # Calculate Hessian H = \nabla^2 loss_fn
-        # Covariance C = 2 * H^-1
+        # Compute Fisher Diagonal directly (Scalar Fisher)
+        # Avoids computing full Hessian.
+        fisher_diag = compute_fisher_diagonal(images_data, batches, len(initial_fluxes))
 
-        # Calculate full Hessian
-        H = hessian(loss_fn)(optimized_fluxes)
-
-        # Scalar Fisher (Diagonal approximation) as requested.
-        # F_ss = 0.5 * H_ss
-        # Variance = 1 / F_ss = 2.0 / H_ss
-
-        h_diag = jnp.diag(H)
+        # Variance = 1.0 / F_ss (since Hessian approx = 2 * F_ss, and Variance = 2 / Hessian)
 
         # Avoid division by zero
-        h_diag = jnp.where(h_diag == 0, 1e-12, h_diag)
+        fisher_diag = jnp.where(fisher_diag <= 0, 1e-12, fisher_diag)
 
-        variances = 2.0 / h_diag
+        variances = 1.0 / fisher_diag
 
         return optimized_fluxes, variances
 
