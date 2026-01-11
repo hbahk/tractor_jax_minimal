@@ -248,7 +248,7 @@ def extract_model_data(tractor_obj, oversample_rendering=False):
                 gal_flux_idx.append(f_idx)
                 gal_pos_pix.append(pos_pix)
                 gal_wcs_cd_inv.append(cd_inv)
-                gal_shapes.append(src.shape.getParams())
+                gal_shapes.append(src.shape.getAllParams())
 
                 gal_profiles.append(
                     {
