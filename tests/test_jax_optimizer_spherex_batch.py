@@ -1,5 +1,6 @@
 import time
 import re
+from functools import partial
 
 import astropy.units as u
 import matplotlib.pyplot as plt
@@ -14,7 +15,7 @@ import jax.numpy as jnp
 from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
 from tractor.brightness import Flux
 from tractor.wcs import PixPos, AstropyWCS, RaDecPos, AffineWCS
-from tractor.jax.optimizer import JaxOptimizer, extract_model_data, optimize_fluxes, render_image
+from tractor.jax.optimizer import JaxOptimizer, extract_model_data, solve_fluxes_core
 from tractor.psf import PixelizedPSF
 import tractor
 from tractor import ConstantSky, Flux, LinearPhotoCal, NullWCS, PixPos, PointSource, RaDecPos
@@ -118,6 +119,8 @@ def test_jax_optimizer_spherex_batch(idx_list):
     tab["shape_ab"] = ab
 
     nframes = (len(hdul) - 2) // 6
+
+    optimizer = JaxOptimizer()
 
     # 1. First Pass: Collect data and determine Max Shapes
     frames_data = []
@@ -265,34 +268,87 @@ def test_jax_optimizer_spherex_batch(idx_list):
 
             frame_sources.append(_src)
 
-        trac = Tractor([tim], frame_sources)
+        trac = Tractor([tim], frame_sources, optimizer=optimizer)
         tractor_list.append(trac)
 
-    print("Stacking Tractor objects...")
+    print("Precomputing model data...")
     start_time = time.time()
-    batched_tractor = jax.tree_util.tree_map(lambda *x: jnp.stack(x), *tractor_list)
+
+    images_data_list = []
+    batches_list = []
+    fluxes_list = []
+
+    for trac in tractor_list:
+        images_data, batches, initial_fluxes = extract_model_data(
+            trac,
+            oversample_rendering=True,
+            fit_background=True
+        )
+        images_data_list.append(images_data)
+        batches_list.append(batches)
+        fluxes_list.append(initial_fluxes)
+
+    end_time = time.time()
+    print(f"Time to precompute: {end_time - start_time} seconds")
+
+    print("Stacking model data...")
+    start_time = time.time()
+    images_data_batched = jax.tree_util.tree_map(
+        lambda *x: jnp.stack(x), *images_data_list
+    )
+    batches_batched = jax.tree_util.tree_map(
+        lambda *x: jnp.stack(x), *batches_list
+    )
+    fluxes_batched = jnp.stack(fluxes_list)
     end_time = time.time()
     print(f"Time to stack: {end_time - start_time} seconds")
-    
+
     print("Running JAX optimization...")
     start_time = time.time()
 
-    def run_opt(trac):
-        return optimize_fluxes(
-            trac,
-            return_variances=True,
-            fit_background=True,
-            oversample_rendering=True,
-            vmap_images=False,
-            update_catalog=False
-        )
+    sample_batches = batches_list[0] if batches_list else {}
+    batches_in_axes = {}
+    if "PointSource" in sample_batches:
+        batches_in_axes["PointSource"] = {
+            "flux_idx": None,
+            "pos_pix": 0,
+        }
+    if "Galaxy" in sample_batches:
+        batches_in_axes["Galaxy"] = {
+            "flux_idx": None,
+            "pos_pix": 0,
+            "wcs_cd_inv": 0,
+            "shapes": None,
+            "profile": {
+                "amp": None,
+                "mean": None,
+                "var": None,
+            },
+        }
+    if "Background" in sample_batches:
+        batches_in_axes["Background"] = {
+            "flux_idx": None
+        }
 
-    vmap_opt = jax.jit(jax.vmap(run_opt))
-    results = vmap_opt(batched_tractor)
+    solve_images_vmap = jax.vmap(
+        partial(solve_fluxes_core, return_variances=True),
+        in_axes=(0, 0, batches_in_axes)
+    )
+    solve_tractors_vmap = jax.vmap(
+        solve_images_vmap,
+        in_axes=(0, 0, 0)
+    )
+
+    fluxes_stack, variances_stack = jax.jit(solve_tractors_vmap)(
+        fluxes_batched, images_data_batched, batches_batched
+    )
     end_time = time.time()
     print(f"Time to optimize fluxes: {end_time - start_time} seconds")
 
-    fluxes_stack, variances_stack = results[0]
+    # If each tractor has a single image, drop the image axis.
+    if fluxes_stack.ndim == 3:
+        fluxes_stack = fluxes_stack[:, 0]
+        variances_stack = variances_stack[:, 0]
 
     gra, gdec = 258.2084186 * u.deg, 64.0529535 * u.deg
     gco = SkyCoord(ra=gra, dec=gdec)

@@ -305,10 +305,18 @@ def extract_model_data(tractor_obj, oversample_rendering=False, fit_background=F
                 gal_pos_pix_list.append(pos_pix)
                 gal_wcs_cd_inv_list.append(cd_inv)
                 gal_shapes.append(src.shape.getAllParams())
+                if hasattr(prof, "mog"):
+                    amp = prof.mog.amp
+                    mean = prof.mog.mean
+                    var = prof.mog.var
+                else:
+                    amp = prof.amp
+                    mean = prof.mean
+                    var = prof.var
                 gal_profiles.append({
-                    "amp": np.array(prof.amp),
-                    "mean": np.array(prof.mean),
-                    "var": np.array(prof.var),
+                    "amp": np.array(amp),
+                    "mean": np.array(mean),
+                    "var": np.array(var),
                 })
 
     # Build Batches

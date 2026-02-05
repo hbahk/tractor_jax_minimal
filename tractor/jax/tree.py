@@ -7,7 +7,21 @@ from tractor.wcs import NullWCS, PixPos, RaDecPos, AffineWCS
 from tractor.psf import PixelizedPSF, GaussianMixturePSF
 from tractor.utils import MogParams, ScalarParam, ParamList
 from tractor.brightness import Flux, LinearPhotoCal, NullPhotoCal
-from tractor.galaxy import JaxGalaxy
+from tractor.galaxy import JaxGalaxy, GalaxyShape
+
+class MogProfile:
+    def __init__(self, amp, mean, var):
+        self.amp = amp
+        self.mean = mean
+        self.var = var
+
+
+def _restore_mogparams(children):
+    amp, mean, var = children
+    if getattr(mean, "ndim", 0) > 2:
+        return MogProfile(amp, mean, var)
+    return MogParams(amp, mean, var)
+
 
 def register_pytree_nodes():
     # Tractor
@@ -100,12 +114,19 @@ def register_pytree_nodes():
     jax.tree_util.register_pytree_node(
         MogParams,
         lambda p: ((p.mog.amp, p.mog.mean, p.mog.var), None),
-        lambda aux, children: MogParams(children[0], children[1], children[2])
+        lambda aux, children: _restore_mogparams(children)
+    )
+
+    # MogProfile (batched-safe)
+    jax.tree_util.register_pytree_node(
+        MogProfile,
+        lambda p: ((p.amp, p.mean, p.var), None),
+        lambda aux, children: MogProfile(children[0], children[1], children[2])
     )
 
     # ParamList and subclasses
     # We must register subclasses explicitly to preserve type
-    for cls in [ParamList, PixPos, RaDecPos]:
+    for cls in [ParamList, PixPos, RaDecPos, GalaxyShape]:
         jax.tree_util.register_pytree_node(
             cls,
             lambda p: ((p.vals,), (p.liquid,)),
