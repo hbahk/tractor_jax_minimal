@@ -235,7 +235,7 @@ def test_jax_optimizer_accuracy():
         # We need variance=True to match user loop signature, though we don't use it here
         flux = trac_spherex.catalog[main_idx].brightness.getParams()[0] * PIX_SR * 1.0e9
         print(f"Before Step {step}: Flux={flux:.6f}")
-        dlnp, X, alpha, var = trac_spherex.optimize(variance=True, shared_params=False)
+        dlnp, X, alpha, var = trac_spherex.optimize(variance=True, shared_params=False, use_sharding=False)
         # print(f"Step {step}: dlnp={dlnp}")
         if dlnp < dchisq:
             break
@@ -384,7 +384,7 @@ def test_jax_optimizer_multiple(idx_list):
         for step in range(10):
             flux = trac_spherex.catalog[main_idx].brightness.getParams()[0] * PIX_SR * 1.0e9
             print(f"Before Step {step}: Flux={flux:.6f}")
-            dlnp, X, alpha, var = trac_spherex.optimize(variance=True, shared_params=False)
+            dlnp, X, alpha, var = trac_spherex.optimize(variance=True, shared_params=False, use_sharding=False)
             if dlnp < dchisq:
                 break
 
@@ -397,14 +397,14 @@ def test_jax_optimizer_multiple(idx_list):
     return cutout_info[idx_list]
 
 if __name__ == "__main__":
-    # test_jax_optimizer_accuracy()
+    test_jax_optimizer_accuracy()
     
     # test_index = np.arange(0, 3000, 60)
     test_index = np.arange(0, 3000, 300)
     cutout_info = test_jax_optimizer_multiple(test_index)
     cutout_info.write("tests/test_jax_optimizer_spherex_radec.parquet", overwrite=True)
     
-    cpu_result = Table.read("/data1/hbahk/spherex-cluster/codes/realworld/specphot_results_testgal_a2255.parquet")
+    cpu_result = Table.read("/data1/hbahk/spherex-cluster/codes/realworld/specphot_results_testgal_a2255_b.parquet")
 
     wave = cpu_result["central_wavelength"]
     flux = cpu_result["flux"]

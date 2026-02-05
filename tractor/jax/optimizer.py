@@ -984,7 +984,7 @@ class JaxOptimizer(Optimizer):
 
     def optimize(self, tractor, alphas=None, damp=0, priors=True,
                  scale_columns=True, shared_params=True, variance=False,
-                 just_variance=False, **kwargs):
+                 just_variance=False, vmap_images=True, use_sharding=True, **kwargs):
         """
         Performs optimization using JAX.
         """
@@ -1005,7 +1005,9 @@ class JaxOptimizer(Optimizer):
             return_variances=variance,
             fit_background=True,
             oversample_rendering=True,
-            update_catalog=True
+            update_catalog=True,
+            vmap_images=vmap_images,
+            use_sharding=use_sharding
         )
 
         # tractor catalog is updated.
