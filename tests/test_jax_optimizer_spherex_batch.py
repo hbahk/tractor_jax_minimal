@@ -97,6 +97,50 @@ def pad_mog(mog_params, max_K):
 
     return new_amp, new_mean, new_var
 
+def downsample_psf_oversample2(psf):
+    """Downsample 2x while preserving center and total sum."""
+    h, w = psf.shape
+    cy, cx = h // 2, w // 2
+    oh, ow = h // 2 + 1, w // 2 + 1
+    ocy, ocx = oh // 2, ow // 2
+
+    out = np.zeros((oh, ow), dtype=psf.dtype)
+
+    # Quadrants (2x2 block averages)
+    out[0:ocy, 0:ocx] = 0.25 * (
+        psf[0:cy:2, 0:cx:2] + psf[1:cy:2, 0:cx:2]
+        + psf[0:cy:2, 1:cx:2] + psf[1:cy:2, 1:cx:2]
+    )
+    out[0:ocy, ocx+1:ow] = 0.25 * (
+        psf[0:cy:2, cx+1:w:2] + psf[1:cy:2, cx+1:w:2]
+        + psf[0:cy:2, cx+2:w:2] + psf[1:cy:2, cx+2:w:2]
+    )
+    out[ocy+1:oh, 0:ocx] = 0.25 * (
+        psf[cy+1:h:2, 0:cx:2] + psf[cy+2:h:2, 0:cx:2]
+        + psf[cy+1:h:2, 1:cx:2] + psf[cy+2:h:2, 1:cx:2]
+    )
+    out[ocy+1:oh, ocx+1:ow] = 0.25 * (
+        psf[cy+1:h:2, cx+1:w:2] + psf[cy+2:h:2, cx+1:w:2]
+        + psf[cy+1:h:2, cx+2:w:2] + psf[cy+2:h:2, cx+2:w:2]
+    )
+
+    # Center row/column (1x2 or 2x1 averages)
+    out[ocy, 0:ocx] = 0.5 * (psf[cy, 0:cx:2] + psf[cy, 1:cx:2])
+    out[ocy, ocx+1:ow] = 0.5 * (psf[cy, cx+1:w:2] + psf[cy, cx+2:w:2])
+    out[0:ocy, ocx] = 0.5 * (psf[0:cy:2, cx] + psf[1:cy:2, cx])
+    out[ocy+1:oh, ocx] = 0.5 * (psf[cy+1:h:2, cx] + psf[cy+2:h:2, cx])
+
+    # Center pixel
+    out[ocy, ocx] = psf[cy, cx]
+
+    # Preserve total flux
+    total = psf.sum()
+    out_sum = out.sum()
+    if out_sum != 0:
+        out *= total / out_sum
+
+    return out
+
 def _build_tractor_for_frame(
     frame,
     tab,
@@ -127,7 +171,7 @@ def _build_tractor_for_frame(
     invvar_padded = pad_array(invvar, (max_h, max_w))
 
     psf_padded = pad_array(psf_data, (max_psf_h, max_psf_w))
-    psf_tractor = PixelizedPSF(psf_padded, sampling=0.1)
+    psf_tractor = PixelizedPSF(psf_padded, sampling=0.2)
 
     # WCS
     wcs = WCS(hdr)
@@ -254,7 +298,7 @@ def test_jax_optimizer_spherex_batch(idx_list):
         gx, gy = cutout_info["x"][i], cutout_info["y"][i]
         zoneid = get_nearest_psf_zone_index(gx, gy, psf_lookup)
         zidx = np.where(psf_lookup["zone_id"] == zoneid)[0][0]
-        psf_data = psf_cube[zidx]
+        psf_data = downsample_psf_oversample2(psf_cube[zidx])
         max_psf_h = max(max_psf_h, psf_data.shape[0])
         max_psf_w = max(max_psf_w, psf_data.shape[1])
 
@@ -410,18 +454,23 @@ if __name__ == "__main__":
     except ValueError:
         pass
 
-    # test_index = np.arange(0, 3000, 100)
+    start_time = time.time()
+
+    # test_index = np.arange(0, 3000, 30)
     # Check if files exist to avoid error
     import os
     if os.path.exists("tests/testphot.fits"):
         hdul = fits.open("tests/testphot.fits")
         cutout_info = Table(hdul[1].data)
+        cutout_info["flux"] = np.full(len(cutout_info), np.nan)
+        cutout_info["flux_err"] = np.full(len(cutout_info), np.nan)
         test_index = np.arange(len(cutout_info))
         batch_size = 100
         for i in range(0, len(test_index), batch_size):
             batch_index = test_index[i:i+batch_size]
             batch_cutout_info = test_jax_optimizer_spherex_batch(batch_index)
-            cutout_info[batch_index] = batch_cutout_info[batch_index]
+            cutout_info["flux"][batch_index] = batch_cutout_info["flux"][batch_index]
+            cutout_info["flux_err"][batch_index] = batch_cutout_info["flux_err"][batch_index]
 
         cutout_info.write("tests/test_jax_optimizer_spherex_batch.parquet", overwrite=True)
 
@@ -438,5 +487,7 @@ if __name__ == "__main__":
             ax.errorbar(cutout_info["central_wavelength"], cutout_info["flux"], cutout_info["flux_err"], fmt=".", label="flux (JAX Batched)", color="tab:red")
             ax.legend()
             fig.savefig("tests/test_jax_optimizer_spherex_batch_comparison.png", dpi=300, bbox_inches='tight')
+        end_time = time.time()
+        print(f"Time to run the test: {(end_time - start_time) / 60} minutes")
     else:
         print("Test data not found. Skipping execution.")
