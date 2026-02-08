@@ -15,6 +15,7 @@ from astropy.table import Table
 from astropy.wcs import WCS
 import jax
 import jax.numpy as jnp
+from photutils.background import Background2D, MedianBackground
 from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
 from tractor.brightness import Flux
 from tractor.wcs import PixPos, AstropyWCS, RaDecPos, AffineWCS
@@ -30,6 +31,10 @@ from utils import get_nearest_psf_zone_index, sky_pa_to_pixel_pa, SPHERExSersicG
 
 THAW_SHAPE = False
 THAW_POSITIONS = False
+
+BKG_MODEL = "photutils"
+BKG_BOX_SIZE = 15
+BKG_FILTER_SIZE = 3
 
 PIX_SR = ((6.15 * u.arcsec)**2).to_value(u.sr)
 
@@ -67,6 +72,73 @@ MASK_FLAGS = [
 MASKBITS = 0
 for name in MASK_FLAGS:
     MASKBITS |= (1 << FLAG_BITS[name])
+
+def build_background_mask(flg, var, maskbits, source_bit):
+    bad = (flg & maskbits) != 0
+    source = (flg & source_bit) != 0
+    valid_var = np.isfinite(var) & (var > 0)
+    return bad | source | (~valid_var)
+
+def fit_background_plane(img, bkg, flg, var, maskbits, source_bit, grid=None):
+    """Fit order-1 2D polynomial to background pixels (weighted)."""
+    if img.size == 0:
+        return bkg
+
+    # Build valid mask: exclude source + bad flags + non-finite/zero variance.
+    mask = build_background_mask(flg, var, maskbits, source_bit)
+    valid = ~mask
+
+    if not np.any(valid):
+        return bkg
+
+    # Work on residual after existing background.
+    z = (img - bkg)[valid].ravel()
+    w = (1.0 / var[valid]).ravel()
+
+    # Coordinates for design matrix.
+    if grid is None:
+        yy, xx = np.indices(img.shape)
+    else:
+        yy, xx = grid
+    x = xx[valid].ravel().astype(np.float64)
+    y = yy[valid].ravel().astype(np.float64)
+
+    # Weighted least squares: z = a + b*x + c*y
+    A = np.stack([np.ones_like(x), x, y], axis=1)
+    Aw = A * w[:, None]
+    AtAw = A.T @ Aw
+    AtAz = A.T @ (z * w)
+    try:
+        coeff = np.linalg.solve(AtAw, AtAz)
+    except np.linalg.LinAlgError:
+        return bkg
+
+    a, b, c = coeff
+    plane = (a + b * xx + c * yy).astype(bkg.dtype, copy=False)
+    return bkg + plane
+
+def fit_background_photutils(img, bkg, flg, var, maskbits, source_bit, box_size, filter_size):
+    """Fit background with photutils Background2D on residual image."""
+    if img.size == 0:
+        return bkg
+
+    if img.shape[0] < box_size or img.shape[1] < box_size:
+        return bkg
+
+    mask = build_background_mask(flg, var, maskbits, source_bit)
+    residual = img - bkg
+    try:
+        bkg2d = Background2D(
+            residual,
+            box_size=(box_size, box_size),
+            filter_size=(filter_size, filter_size),
+            mask=mask,
+            # bkg_estimator=MedianBackground(),
+        )
+    except Exception:
+        return bkg
+
+    return bkg + bkg2d.background.astype(bkg.dtype, copy=False)
 
 def pad_array(arr, target_shape):
     pads = [(0, t - s) for s, t in zip(arr.shape, target_shape)]
@@ -190,8 +262,8 @@ def _build_tractor_for_frame(
         data=img_padded - bkg_padded,
         inverr=np.sqrt(invvar_padded),
         psf=psf_tractor,
-        # wcs=affine_wcs,
-        wcs=NullWCS(pixscale=6.15),
+        wcs=affine_wcs,
+        # wcs=NullWCS(pixscale=6.15),
         photocal=LinearPhotoCal(1.0),
         sky=ConstantSky(0.0),
     )
@@ -274,6 +346,7 @@ def test_jax_optimizer_spherex_batch(idx_list):
     max_h, max_w = 0, 0
     max_psf_h, max_psf_w = 0, 0
     max_mog_K = 0
+    grid_cache = {}
 
     print("Loading frames and determining shapes...")
     for i in tqdm(idx_list):
@@ -291,6 +364,32 @@ def test_jax_optimizer_spherex_batch(idx_list):
         flg = hdul[flg_idx].data
         var = hdul[var_idx].data
         bkg = hdul[bkg_idx].data
+
+        # Fit background on non-source, non-bad pixels.
+        if BKG_MODEL == "photutils":
+            bkg = fit_background_photutils(
+                img=img,
+                bkg=bkg,
+                flg=flg,
+                var=var,
+                maskbits=MASKBITS,
+                source_bit=(1 << FLAG_BITS["SOURCE"]),
+                box_size=BKG_BOX_SIZE,
+                filter_size=BKG_FILTER_SIZE,
+            )
+        else:
+            shape_key = img.shape
+            if shape_key not in grid_cache:
+                grid_cache[shape_key] = np.indices(shape_key)
+            bkg = fit_background_plane(
+                img=img,
+                bkg=bkg,
+                flg=flg,
+                var=var,
+                maskbits=MASKBITS,
+                source_bit=(1 << FLAG_BITS["SOURCE"]),
+                grid=grid_cache[shape_key],
+            )
 
         psf_cube = hdul[psf_idx].data
         psf_lookup = hdul[psf_lookup_idx].data
@@ -482,7 +581,8 @@ if __name__ == "__main__":
         cutout_info["flux_err"] = np.full(len(cutout_info), np.nan)
         test_index = np.arange(len(cutout_info))
         batch_size = 500
-        for i in range(0, len(test_index), batch_size):
+        # for i in range(0, len(test_index), batch_size):
+        for i in range(1000, 2000, batch_size):
             batch_index = test_index[i:i+batch_size]
             batch_cutout_info = test_jax_optimizer_spherex_batch(batch_index)
             cutout_info["flux"][batch_index] = batch_cutout_info["flux"][batch_index]
