@@ -164,6 +164,54 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
     def getRadius(self):
         return self.radius
 
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius containing the specified fraction of the flux.
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        img = self.img
+        H, W = img.shape
+        cx, cy = W / 2., H / 2.
+
+        # Grid of coordinates
+        y, x = np.mgrid[:H, :W]
+        r2 = (x - cx + 0.5)**2 + (y - cy + 0.5)**2
+        r = np.sqrt(r2)
+
+        # Flatten and sort by radius
+        r_flat = r.ravel()
+        flux_flat = img.ravel()
+
+        # Sort
+        idx = np.argsort(r_flat)
+        r_sorted = r_flat[idx]
+        flux_sorted = flux_flat[idx]
+
+        # Cumulative flux
+        cum_flux = np.cumsum(flux_sorted)
+        total_flux = cum_flux[-1]
+
+        if total_flux <= 0:
+            return self.radius # Fallback
+
+        target = total_flux * flux_fraction
+
+        # Find index
+        k = np.searchsorted(cum_flux, target)
+        if k >= len(r_sorted):
+            r_eff = r_sorted[-1]
+        else:
+            r_eff = r_sorted[k]
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = r_eff
+
+        return r_eff
+
     def getImage(self, px, py):
         return self.img
 
@@ -564,6 +612,43 @@ class GaussianMixturePSF(MogParams, ducks.ImageCalibration):
         meig = max([max(abs(numpy.linalg.eigvalsh(v)))
                     for v in self.mog.var])
         return self.getNSigma() * np.sqrt(meig)
+
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius using an analytic Gaussian approximation.
+        r_eff = max_k ( sigma_scale * sqrt(lambda_max_k) )
+        where sigma_scale = sqrt(2 * ln(1/(1-f)))
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        # Calculate sigma scale factor
+        # f = 1 - exp(-r^2 / (2sigma^2))
+        # 1-f = exp(...)
+        # ln(1-f) = -r^2 / 2sigma^2
+        # r^2 = -2sigma^2 ln(1-f)
+        # r = sigma * sqrt(-2 ln(1-f))
+
+        sigma_scale = np.sqrt(-2.0 * np.log(1.0 - flux_fraction))
+
+        import numpy.linalg
+        max_r = 0.0
+
+        for k in range(len(self.mog.amp)):
+            v = self.mog.var[k]
+            # Max eigenvalue (variance along major axis)
+            lambda_max = max(abs(numpy.linalg.eigvalsh(v)))
+            sigma = np.sqrt(lambda_max)
+            r = sigma * sigma_scale
+            if r > max_r:
+                max_r = r
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = max_r
+
+        return max_r
 
     def getNSigma(self):
         # MAGIC -- N sigma for rendering patches
@@ -1011,6 +1096,28 @@ class NCircularGaussianPSF(MultiParams, ducks.ImageCalibration):
         if hasattr(self, 'radius'):
             return self.radius
         return max(self.minradius, max(self.mysigmas) * self.getNSigma())
+
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius.
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        sigma_scale = np.sqrt(-2.0 * np.log(1.0 - flux_fraction))
+
+        max_r = 0.0
+        for s in self.mysigmas:
+            r = s * sigma_scale
+            if r > max_r:
+                max_r = r
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = max_r
+
+        return max_r
 
     # returns a Patch object.
     def getPointSourcePatch(self, px, py, minval=0., radius=None,
