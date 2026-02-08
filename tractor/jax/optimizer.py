@@ -73,7 +73,7 @@ def assign_buckets(
     if bucket_mode == "fixed":
         if bucket_sizes is None:
             # Fallback default
-            bucket_sizes = [128, 256, 512, 1024, 2048]
+            bucket_sizes = [32, 64, 128, 256, 512, 1024, 2048, 4096]
 
         # In fixed mode, we assume bucket_sizes defines the allowed grid.
         # It can be a list of ints (squares) or tuples.
