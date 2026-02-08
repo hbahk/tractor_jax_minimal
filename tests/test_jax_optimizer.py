@@ -54,8 +54,9 @@ def test_jax_optimizer_accuracy():
     single_batches = {}
     if 'PointSource' in batches:
         single_batches['PointSource'] = {
-            'flux_idx': batches['PointSource']['flux_idx'],
-            'pos_pix': batches['PointSource']['pos_pix'][0]
+            'flux_idx': batches['PointSource']['flux_idx'][0],
+            'pos_pix': batches['PointSource']['pos_pix'][0],
+            'mask': batches['PointSource']['mask'][0] if 'mask' in batches['PointSource'] else None
         }
 
     true_model = render_image(initial_fluxes[0], single_image_data, single_batches)
