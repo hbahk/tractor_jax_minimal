@@ -4,6 +4,12 @@ import numpy as np
 from tractor.utils import BaseParams, ParamList, MultiParams, ArithmeticParams
 from tractor import ducks
 
+try:
+    from astropy.wcs import WCS as AstropyWCSObject
+    from astropy import wcs as astropy_wcs
+    _have_astropy = True
+except ImportError:
+    _have_astropy = False
 
 class NullWCS(BaseParams, ducks.WCS):
     '''
@@ -49,325 +55,104 @@ class NullWCS(BaseParams, ducks.WCS):
         return self.copy()
 
 
-class WcslibWcs(BaseParams, ducks.ImageCalibration):
+class AstropyWCS(BaseParams, ducks.WCS):
     '''
-    A WCS implementation that wraps a FITS WCS object (with a pixel
-    offset), delegating to wcslib.
-
-    FIXME: we could use the "wcssub()" functionality to handle subimages
-    rather than x0,y0.
-
-    FIXME: we could implement anwcs_copy() using wcscopy().
-
+    A Tractor WCS implementation that wraps an astropy.wcs.WCS object.
     '''
-
-    def __init__(self, filename, hdu=0, wcs=None):
-        self.x0 = 0.
-        self.y0 = 0.
-        if wcs is not None:
-            self.wcs = wcs
-        else:
-            from astrometry.util.util import anwcs
-            wcs = anwcs(filename, hdu)
-            self.wcs = wcs
-
-    # pickling
-    def __getstate__(self):
-        # print 'pickling wcslib header...'
-        s = self.wcs.getHeaderString()
-        # print 'pickled wcslib header: len', len(s)
-        # print 'Pickling WcslibWcs: string'
-        # print '------------------------------------------------'
-        # print s
-        # print '------------------------------------------------'
-        return (self.x0, self.y0, s)
-
-    def __setstate__(self, state):
-        (x0, y0, hdrstr) = state
-        self.x0 = x0
-        self.y0 = y0
-        from astrometry.util.util import anwcs_from_string
-        # print 'Creating WcslibWcs from header string:'
-        # print '------------------------------------------------'
-        # print hdrstr
-        # print '------------------------------------------------'
-        # print 'Unpickling: wcslib header string length:', len(hdrstr)
-        self.wcs = anwcs_from_string(hdrstr)
-        # print 'unpickling done'
-
-    def copy(self):
-        raise RuntimeError('unimplemented')
-
-    def __str__(self):
-        return ('WcslibWcs: x0,y0 %.3f,%.3f' % (self.x0, self.y0))
-
-    def debug(self):
-        from astrometry.util.util import anwcs_print_stdout
-        print('WcslibWcs:')
-        anwcs_print_stdout(self.wcs)
-
-    def pixel_scale(self):
-        cd = self.cdAtPixel(self.x0, self.y0)
-        return np.sqrt(np.abs(cd[0, 0] * cd[1, 1] - cd[0, 1] * cd[1, 0])) * 3600.
-
-    def setX0Y0(self, x0, y0):
+    def __init__(self, wcs, origin=0):
         '''
-        Sets the pixel offset to apply to pixel coordinates before putting
-        them through the wrapped WCS.  Useful when using a cropped image.
+        wcs: an astropy.wcs.WCS object.
+        origin: 0 or 1.
+          Tractor uses 0-based pixel coordinates (center of first pixel is 0,0).
+          FITS uses 1-based (center of first pixel is 1,1).
+          If `origin` is 0, input (x,y) to positionToPixel/pixelToPosition
+          are treated as 0-based (numpy-like) coordinates.
         '''
-        self.x0 = x0
-        self.y0 = y0
+        if not _have_astropy:
+            raise ImportError("Astropy is required to use AstropyWCS")
+        self.wcs = wcs
+        self.origin = origin
+
+    def hashkey(self):
+        # WCS objects are mutable and don't hash nicely; use the header string representation.
+        return ('AstropyWCS', self.wcs.to_header_string(), self.origin)
 
     def positionToPixel(self, pos, src=None):
-        ok, x, y = self.wcs.radec2pixelxy(pos.ra, pos.dec)
-        # MAGIC: 1 for FITS coords.
-        return x - 1. - self.x0, y - 1. - self.y0
+        if hasattr(pos, 'ra') and hasattr(pos, 'dec'):
+            ra, dec = pos.ra, pos.dec
+        elif hasattr(pos, 'x') and hasattr(pos, 'y'):
+             # Already pixel? This shouldn't happen for a celestial WCS usually.
+             return pos.x, pos.y
+        else:
+             raise ValueError("Unknown position type: %s" % type(pos))
+
+        # astropy.wcs.all_world2pix handles scalar inputs
+        x, y = self.wcs.all_world2pix(ra, dec, self.origin)
+        return float(x), float(y)
 
     def pixelToPosition(self, x, y, src=None):
-        # MAGIC: 1 for FITS coords.
-        ok, ra, dec = self.wcs.pixelxy2radec(
-            x + 1. + self.x0, y + 1. + self.y0)
+        ra, dec = self.wcs.all_pix2world(x, y, self.origin)
         return RaDecPos(ra, dec)
 
     def cdAtPixel(self, x, y):
         '''
-        Returns the ``CD`` matrix at the given ``x,y`` pixel position.
-
-        (Returns the constant ``CD`` matrix elements)
+        Returns the CD matrix at pixel x,y:
+        [ [ dRA/dx * cos(Dec), dRA/dy * cos(Dec) ],
+          [ dDec/dx          , dDec/dy           ] ]
         '''
-        ok, ra0, dec0 = self.wcs.pixelxy2radec(
-            x + 1. + self.x0, y + 1. + self.y0)
-        ok, ra1, dec1 = self.wcs.pixelxy2radec(
-            x + 2. + self.x0, y + 1. + self.y0)
-        ok, ra2, dec2 = self.wcs.pixelxy2radec(
-            x + 1. + self.x0, y + 2. + self.y0)
+        # We compute derivatives numerically to handle distortions correctly.
+        delta = 1e-4
+        r0, d0 = self.wcs.all_pix2world(x, y, self.origin)
+        r1, d1 = self.wcs.all_pix2world(x + delta, y, self.origin)
+        r2, d2 = self.wcs.all_pix2world(x, y + delta, self.origin)
 
-        cosdec = np.cos(np.deg2rad(dec0))
+        # Derivatives of RA, Dec with respect to x, y
+        dRa_dx = (r1 - r0) / delta
+        dDec_dx = (d1 - d0) / delta
+        dRa_dy = (r2 - r0) / delta
+        dDec_dy = (d2 - d0) / delta
 
-        return np.array([[(ra1 - ra0) * cosdec, (ra2 - ra0) * cosdec],
-                         [dec1 - dec0,        dec2 - dec0]])
+        cosdec = np.cos(np.deg2rad(d0))
 
-
-class ConstantFitsWcs(ParamList, ducks.WCS):
-    '''
-    A WCS implementation that wraps a FITS WCS object (with a pixel
-    offset).
-    '''
-
-    def __init__(self, wcs):
-        '''
-        Creates a new ``ConstantFitsWcs`` given an underlying WCS object.
-        '''
-        self.x0 = 0
-        self.y0 = 0
-        super(ConstantFitsWcs, self).__init__()
-        self.wcs = wcs
-
-        cd = self.wcs.get_cd()
-        self.cd = np.array([[cd[0], cd[1]], [cd[2], cd[3]]])
-
-        self.cd_inverse = np.linalg.inv(self.cd)
-        self.pixscale = self.wcs.pixel_scale()
-
-    def hashkey(self):
-        return (self.x0, self.y0, id(self.wcs))
-
-    def copy(self):
-        copy = ConstantFitsWcs(self.wcs)
-        copy.x0 = self.x0
-        copy.y0 = self.y0
-        return copy
-
-    def shifted(self, dx, dy):
-        copy = self.copy()
-        x, y = self.getX0Y0()
-        copy.setX0Y0(x + dx, y + dy)
-        return copy
-
-    def __str__(self):
-        from tractor.utils import getClassName
-        return ('%s: x0,y0 %.3f,%.3f, WCS ' % (getClassName(self), self.x0, self.y0)
-                + str(self.wcs))
-
-    def getX0Y0(self):
-        return self.x0, self.y0
-
-    def setX0Y0(self, x0, y0):
-        '''
-        Sets the pixel offset to apply to pixel coordinates before putting
-        them through the wrapped WCS.  Useful when using a cropped image.
-        '''
-        self.x0 = x0
-        self.y0 = y0
-
-    def positionToPixel(self, pos, src=None):
-        '''
-        Converts an :class:`tractor.RaDecPos` to a pixel position.
-        Returns: tuple of floats ``(x, y)``
-        '''
-        X = self.wcs.radec2pixelxy(pos.ra, pos.dec)
-        # handle X = (ok,x,y) and X = (x,y) return values
-        if len(X) == 3:
-            ok, x, y = X
-        else:
-            assert(len(X) == 2)
-            x, y = X
-        # MAGIC: subtract 1 to convert from FITS to zero-indexed pixels.
-        return x - 1 - self.x0, y - 1 - self.y0
-
-    def pixelToPosition(self, x, y, src=None):
-        '''
-        Converts floats ``x``, ``y`` to a
-        :class:`tractor.RaDecPos`.
-        '''
-        # MAGIC: add 1 to convert from zero-indexed to FITS pixels.
-        r, d = self.wcs.pixelxy2radec(x + 1 + self.x0, y + 1 + self.y0)
-        return RaDecPos(r, d)
-
-    def cdAtPixel(self, x, y):
-        '''
-        Returns the ``CD`` matrix at the given ``x,y`` pixel position.
-
-        (Returns the constant ``CD`` matrix elements)
-        '''
-        return self.cd
-
-    def cdInverseAtPixel(self, x, y):
-        return self.cd_inverse
-
-    def pixel_scale(self):
-        return self.pixscale
+        cd = np.array([
+            [dRa_dx * cosdec, dRa_dy * cosdec],
+            [dDec_dx        , dDec_dy        ]
+        ])
+        return cd
 
     def pixscale_at(self, x, y):
-        '''
-        Returns the local pixel scale at the given *x*,*y* pixel coords,
-        in *arcseconds* per pixel.
-        '''
-        return self.pixscale
-
-    def toStandardFitsHeader(self, hdr):
-        if self.x0 != 0 or self.y0 != 0:
-            wcs = self.wcs.get_subimage(self.x0, self.y0,
-                                        self.wcs.get_width() - self.x0,
-                                        self.wcs.get_height() - self.y0)
-        else:
-            wcs = self.wcs
-        wcs.add_to_header(hdr)
-
-
-class TanWcs(ConstantFitsWcs, ducks.ImageCalibration):
-    '''
-    The WCS object must be an astrometry.util.util.Tan object, or a
-    convincingly quacking duck.
-
-    You can also give it a filename and HDU.
-    '''
-
-    @staticmethod
-    def getNamedParams():
-        return dict(crval1=0, crval2=1, crpix1=2, crpix2=3,
-                    cd1_1=4, cd1_2=5, cd2_1=6, cd2_2=7)
-
-    def __init__(self, wcs, hdu=0):
-        '''
-        Creates a new ``FitsWcs`` given a :class:`~astrometry.util.util.Tan`
-        object.  To create one of these from a filename and FITS HDU extension,
-
-        ::
-            from astrometry.util.util import Tan
-
-            fn = 'my-file.fits'
-            ext = 0
-            TanWcs(Tan(fn, ext))
-
-        To create one from WCS parameters,
-
-            tanwcs = Tan(crval1, crval2, crpix1, crpix2,
-                cd11, cd12, cd21, cd22, imagew, imageh)
-            TanWcs(tanwcs)
-
-        '''
-        if hasattr(self, 'x0'):
-            print('TanWcs has an x0 attr:', self.x0)
-        self.x0 = 0
-        self.y0 = 0
-
-        if isinstance(wcs, basestring):
-            from astrometry.util.util import Tan
-            wcs = Tan(wcs, hdu)
-
-        super(TanWcs, self).__init__(wcs)
-        # ParamList keeps its params in a list; we don't want to do that.
-        del self.vals
-
-    def copy(self):
-        from astrometry.util.util import Tan
-        wcs = self.__class__(Tan(self.wcs))
-        wcs.setX0Y0(self.x0, self.y0)
-        return wcs
+        # Return sqrt(det(CD matrix)) * 3600
+        cd = self.cdAtPixel(x, y)
+        det = np.abs(np.linalg.det(cd))
+        return 3600. * np.sqrt(det)
 
     def shifted(self, dx, dy):
-        copy = self.copy()
-        x, y = self.getX0Y0()
-        copy.setX0Y0(x + dx, y + dy)
-        return copy
+        # Create a copy and shift the CRPIX.
+        # CRPIX is the pixel coordinate of the reference point.
+        # If we shift the image window by (dx, dy),
+        # a pixel (x,y) in the new image corresponds to (x+dx, y+dy) in the original.
+        # The WCS should map (0,0) in new image to same sky as (dx, dy) in old image.
+        # Old WCS: P_old -> Sky.  P_old = P_new + shift.
+        # New WCS should map P_new -> Sky = WCS(P_new + shift).
+        # Typically this is done by modifying CRPIX.
+        # CRPIX_new = CRPIX_old - shift.
 
-    # Here we ASSUME TAN WCS!
-    # oi vey...
-    def _setThing(self, i, val):
-        w = self.wcs
-        if i in [0, 1]:
-            crv = w.crval
-            crv[i] = val
-            w.set_crval(*crv)
-        elif i in [2, 3]:
-            crp = w.crpix
-            crp[i - 2] = val
-            w.set_crpix(*crp)
-        elif i in [4, 5, 6, 7]:
-            cd = list(w.get_cd())
-            cd[i - 4] = val
-            w.set_cd(*cd)
-        elif i == 8:
-            self.x0 = val
-        elif i == 9:
-            self.y0 = val
-        else:
-            raise IndexError
+        wcs_copy = self.wcs.deepcopy()
+        # wcs.wcs.crpix is usually 1-based (FITS convention) but stored as array.
+        # Subtracting shifts works regardless of origin if we are just shifting the grid.
+        wcs_copy.wcs.crpix[0] -= dx
+        wcs_copy.wcs.crpix[1] -= dy
 
-    def _getThing(self, i):
-        w = self.wcs
-        if i in [0, 1]:
-            crv = w.crval
-            return crv[i]
-        elif i in [2, 3]:
-            crp = w.crpix
-            return crp[i - 2]
-        elif i in [4, 5, 6, 7]:
-            cd = w.get_cd()
-            return cd[i - 4]
-        elif i == 8:
-            return self.x0
-        elif i == 9:
-            return self.y0
-        else:
-            raise IndexError
+        # Also need to handle SIP distortions if present?
+        # If SIP is present, crpix is used in the linear transformation before SIP.
+        # However, SIP coefficients depend on pixel coordinates relative to CRPIX.
+        # If we change CRPIX, we are changing where the origin of SIP polynomial is?
+        # Wait. SIP is usually defined relative to CRPIX.
+        # If we change CRPIX, we effectively move the reference point on the image.
+        # This is correct for a crop/shift. The "physical" reference point stays at the same sky location,
+        # but its pixel coordinate in the new image is different.
 
-    def _getThings(self):
-        w = self.wcs
-        return list(w.crval) + list(w.crpix) + list(w.cd) + [self.x0, self.y0]
-
-    def _numberOfThings(self):
-        return 10
-
-    def getStepSizes(self, *args, **kwargs):
-        pixscale = self.wcs.pixel_scale()
-        # we set everything ~ 1 pixel
-        dcrval = pixscale / 3600.
-        # CD matrix: ~1 pixel over image size (call it 1000)
-        dcd = pixscale / 3600. / 1000.
-        ss = [dcrval, dcrval, 1., 1., dcd, dcd, dcd, dcd, 1., 1.]
-        return list(self._getLiquidArray(ss))
+        return AstropyWCS(wcs_copy, origin=self.origin)
 
 
 class PixPos(ParamList):
@@ -420,5 +205,100 @@ class RaDecPos(ArithmeticParams, ParamList):
     #    self.stepsizes = [delta / np.cos(np.deg2rad(self.dec)),delta]
 
     def distanceFrom(self, pos):
-        from astrometry.util.starutil_numpy import degrees_between
-        return degrees_between(self.ra, self.dec, pos.ra, pos.dec)
+        # from astrometry.util.starutil_numpy import degrees_between
+        # Using simple approximation or implementing it here if astrometry is missing
+        # But tractor.wcs previously imported it.
+        # Let's implement a simple great circle distance
+        ra1, dec1 = np.deg2rad(self.ra), np.deg2rad(self.dec)
+        ra2, dec2 = np.deg2rad(pos.ra), np.deg2rad(pos.dec)
+        d = np.sin(dec1)*np.sin(dec2) + np.cos(dec1)*np.cos(dec2)*np.cos(ra1-ra2)
+        # clip to avoid domain errors
+        d = np.clip(d, -1.0, 1.0)
+        return np.rad2deg(np.arccos(d))
+
+class AffineWCS(BaseParams, ducks.WCS):
+    '''
+    A WCS implementation using a simple affine transformation (CD matrix).
+    Supports JAX-traceable operations if attributes are arrays.
+    '''
+    def __init__(self, crpix, crval, cd):
+        self.crpix = crpix
+        self.crval = crval
+        self.cd = cd
+        try:
+            self.cd_inv = np.linalg.inv(self.cd)
+        except Exception:
+            # Handle JAX Tracers
+            import jax.numpy as jnp
+            self.cd_inv = jnp.linalg.inv(self.cd)
+
+    def hashkey(self):
+        return ('AffineWCS', tuple(self.crpix), tuple(self.crval), tuple(self.cd.ravel()))
+
+    def positionToPixel(self, pos, src=None):
+        if hasattr(pos, 'x') and hasattr(pos, 'y'):
+             return pos.x, pos.y
+
+        # Tangent plane projection for RaDecPos
+        ra, dec = pos.ra, pos.dec
+        ra0, dec0 = self.crval
+
+        d2r = np.pi / 180.0
+        ra_r, dec_r = ra * d2r, dec * d2r
+        ra0_r, dec0_r = ra0 * d2r, dec0 * d2r
+
+        xi = np.cos(dec_r) * np.sin(ra_r - ra0_r)
+        eta = np.sin(dec_r) * np.cos(dec0_r) - np.cos(dec_r) * np.sin(dec0_r) * np.cos(ra_r - ra0_r)
+
+        r2d = 180.0 / np.pi
+        xi_deg = xi * r2d
+        eta_deg = eta * r2d
+
+        # (pix - crpix) = CD_inv * (xi, eta)
+        # Using einsum or dot. If mapped, need jnp.
+        # But this class is used in JAX context if registered.
+        # If running in JAX, self.cd_inv is a Tracer.
+        # np.dot handles tracers usually if using jax.numpy?
+        # But this file imports numpy as np.
+        # If inputs are tracers, dispatch happens.
+
+        uv = np.array([xi_deg, eta_deg])
+
+        # Handle batching?
+        # If pos is scalar (one source), uv is (2,). cd_inv is (2,2).
+        # np.dot(cd_inv, uv) -> (2,)
+
+        # Note: If running inside vmap, np.* functions might be JAX primitives if jax.numpy is imported as np,
+        # but here it is standard numpy.
+        # However, JAX tracers passed to numpy functions often trigger JAX dispatch or error.
+        # Safe way is to use operators.
+
+        # xy = cd_inv @ uv + crpix
+        # But standard numpy doesn't support @ for Tracers seamlessly if linalg involved?
+        # Actually JAX tracers implement __array_ufunc__ / __matmul__.
+
+        xy = self.cd_inv @ uv + self.crpix
+
+        return xy[0], xy[1]
+
+    def pixelToPosition(self, x, y, src=None):
+        xy = np.array([x, y]) - self.crpix
+        uv = self.cd @ xy
+        xi_deg, eta_deg = uv[0], uv[1]
+
+        # Simple approx inverse
+        ra0, dec0 = self.crval
+        return RaDecPos(ra0 + xi_deg / np.cos(np.deg2rad(dec0)), dec0 + eta_deg)
+
+    def cdAtPixel(self, x, y):
+        return self.cd
+
+    def cdInverseAtPixel(self, x, y):
+        return self.cd_inv
+
+    def pixscale_at(self, x, y):
+        det = np.abs(np.linalg.det(self.cd))
+        return 3600. * np.sqrt(det)
+
+    def shifted(self, dx, dy):
+        return AffineWCS(self.crpix - np.array([dx, dy]), self.crval, self.cd)

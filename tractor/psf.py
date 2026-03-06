@@ -15,6 +15,7 @@ from tractor.patch import Patch
 from tractor.utils import BaseParams, ParamList, MultiParams, MogParams
 from tractor import mixture_profiles as mp
 from tractor import ducks
+from tractor.utils import savetxt_cpu_append
 
 if sys.version_info[0] == 2:
     # Py2
@@ -37,7 +38,7 @@ def lanczos_shift_image(img, dx, dy, inplace=False, force_python=False):
         or H > work_corr7f.shape[0] or W > work_corr7f.shape[1]):
         # fallback to python:
         from scipy.ndimage import correlate1d
-        from astrometry.util.miscutils import lanczos_filter
+        from tractor.miscutils import lanczos_filter
         L = 3
         Lx = lanczos_filter(L, np.arange(-L, L+1) + dx)
         Ly = lanczos_filter(L, np.arange(-L, L+1) + dy)
@@ -56,6 +57,24 @@ def lanczos_shift_image(img, dx, dy, inplace=False, force_python=False):
     if inplace:
         img[:,:] = outimg
     return outimg
+
+def lanczos_shift_image_batch_gpu(imgs, dxs, dys):
+    """Translated from lanczos_shift_image python version to GPU using cupy
+        and helper functions from tractor.miscutils"""
+    import jax.numpy as jnp
+    from tractor.miscutils import lanczos_filter, batch_correlate1d
+    L = 3
+    nimg = dxs.size 
+    lr = jnp.tile(jnp.arange(-L, L+1), (nimg, 1))
+    Lx = lanczos_filter(L, lr+dxs.reshape((nimg,1)))
+    Ly = lanczos_filter(L, lr+dys.reshape((nimg,1)))
+    # Normalize the Lanczos interpolants (preserve flux)
+    Lx /= Lx.sum(1).reshape((nimg,1))
+    Ly /= Ly.sum(1).reshape((nimg,1))
+    sx = batch_correlate1d(imgs, Lx, axis=2, mode='constant')
+    outimg = batch_correlate1d(sx, Ly, axis=1, mode='constant')
+    return outimg
+
 
 # GLOBAL scratch array for lanczos_shift_image!
 work_corr7f = np.zeros((4096, 4096), np.float32)
@@ -89,11 +108,25 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
            shifting the image to subpixel positions.
         '''
         # ensure float32 and align
-        img = img.astype(np.float32)
-        self.img = np.require(img, requirements=['A'])
-        H,W = img.shape
-        assert((H % 2) == 1)
-        assert((W % 2) == 1)
+        if isinstance(img, np.ndarray):
+            img = img.astype(np.float32)
+            self.img = np.require(img, requirements=['A'])
+        else:
+            # Assume it's a JAX Tracer or other array-like
+            self.img = img
+
+        # Handle batching (JAX vmap)
+        if img.ndim >= 2:
+            H,W = img.shape[-2:]
+        else:
+            # Fallback
+            H,W = img.shape
+
+        # Only assert if we are strictly 2D (not batched) to avoid breaking vmap construction
+        if img.ndim == 2:
+            assert((H % 2) == 1)
+            assert((W % 2) == 1)
+
         self.radius = np.hypot(H / 2., W / 2.)
         self.H, self.W = H, W
         self.Lorder = Lorder
@@ -131,20 +164,70 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
     def getRadius(self):
         return self.radius
 
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius containing the specified fraction of the flux.
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        img = self.img
+        H, W = img.shape
+        cx, cy = W / 2., H / 2.
+
+        # Grid of coordinates
+        y, x = np.mgrid[:H, :W]
+        r2 = (x - cx + 0.5)**2 + (y - cy + 0.5)**2
+        r = np.sqrt(r2)
+
+        # Flatten and sort by radius
+        r_flat = r.ravel()
+        flux_flat = img.ravel()
+
+        # Sort
+        idx = np.argsort(r_flat)
+        r_sorted = r_flat[idx]
+        flux_sorted = flux_flat[idx]
+
+        # Cumulative flux
+        cum_flux = np.cumsum(flux_sorted)
+        total_flux = cum_flux[-1]
+
+        if total_flux <= 0:
+            return self.radius # Fallback
+
+        target = total_flux * flux_fraction
+
+        # Find index
+        k = np.searchsorted(cum_flux, target)
+        if k >= len(r_sorted):
+            r_eff = r_sorted[-1]
+        else:
+            r_eff = r_sorted[k]
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = r_eff
+
+        return r_eff
+
     def getImage(self, px, py):
         return self.img
 
     def getPointSourcePatch(self, px, py, minval=0., modelMask=None,
                             radius=None, **kwargs):
+        #print ("getPointSourcePatch1", self)
         if self.sampling != 1.:
             return self._getOversampledPointSourcePatch(px, py, minval=minval,
                                                         modelMask=modelMask,
                                                         radius=radius, **kwargs)
 
-        from astrometry.util.miscutils import get_overlapping_region
+        from tractor.miscutils import get_overlapping_region
 
         # get PSF image at desired pixel location
         img = self.getImage(px, py)
+        #print (f'{px=} {py=} {radius=} {minval=}')
 
         if radius is not None:
             R = int(np.ceil(radius))
@@ -155,6 +238,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
                       max(cx-R, 0) : min(cx+R+1,W-1)]
             
         H, W = img.shape
+        #print (f'{H=} {W=}')
         # float() required because builtin round(np.float64(11.0)) returns 11.0 !!
         ix = round(float(px))
         iy = round(float(py))
@@ -162,13 +246,16 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
         dy = py - iy
         x0 = ix - W // 2
         y0 = iy - H // 2
+        #print (f'{ix=} {iy=} {dx=} {dy=} {x0=} {y0=}')
 
         if modelMask is None:
+            #print ("NO MM")
             outimg = lanczos_shift_image(img, dx, dy)
             return Patch(x0, y0, outimg)
 
         mh, mw = modelMask.shape
         mx0, my0 = modelMask.x0, modelMask.y0
+        #print ("MM", mh, mw, mx0, my0, modelMask)
 
         # print 'PixelizedPSF + modelMask'
         # print 'mx0,my0', mx0,my0, '+ mw,mh', mw,mh
@@ -176,18 +263,23 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
 
         if ((mx0 >= x0 + W) or (mx0 + mw <= x0) or
             (my0 >= y0 + H) or (my0 + mh <= y0)):
+            #print ("NO OVERLAP")
             # No overlap
             return None
         # Otherwise, we'll just produce the Lanczos-shifted PSF
         # image as usual, and then copy it into the modelMask
         # space.
+        #print ("OVERLAP")
         L = 3
         padding = L
         # Create a modelMask + padding sized stamp and insert PSF image into it
         mm = np.zeros((mh+2*padding, mw+2*padding), np.float32)
+        #print ("OVERLAPY", my0-y0-padding,my0-y0+mh-1+padding, 0, H-1)
         yi,yo = get_overlapping_region(my0-y0-padding, my0-y0+mh-1+padding, 0, H-1)
+        #print ("YI", yi, "YO", yo)
         xi,xo = get_overlapping_region(mx0-x0-padding, mx0-x0+mw-1+padding, 0, W-1)
         mm[yo,xo] = img[yi,xi]
+        #print (mm[yo,xo].shape, img[yi,xi].shape)
         mm = lanczos_shift_image(mm, dx, dy)
         mm = mm[padding:-padding, padding:-padding]
         assert(np.all(np.isfinite(mm)))
@@ -239,7 +331,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
         Returns the Fourier Transform of this PSF, with the
         next-power-of-2 size up from *radius*.
 
-        Returns: (FFT, (x0, y0), (imh,imw), (v,w))
+        Returns: (FFT, (xc, yc), (imh,imw), (v,w))
 
         *FFT*: numpy array, the FFT
         *xc*: float, pixel location of the PSF /center/ in the PSF subimage
@@ -252,11 +344,11 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
             return self._getOversampledFourierTransform(px, py, radius)
 
         sz = self.getFourierTransformSize(radius)
-        # print 'PixelizedPSF FFT size', sz
         if sz in self.fftcache:
             return self.fftcache[sz]
 
         pad, cx, cy = self._padInImage(sz, sz)
+        #savetxt_cpu_append("cpad.txt", pad)
         # cx,cy: coordinate of the PSF center in *pad*
         P = np.fft.rfft2(pad)
         P = P.astype(np.complex64)
@@ -264,6 +356,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
         v = np.fft.rfftfreq(pW)
         w = np.fft.fftfreq(pH)
         rtn = P, (cx, cy), (pH, pW), (v, w)
+        #savetxt_cpu_append("cp2.txt", P)
         self.fftcache[sz] = rtn
         return rtn
 
@@ -271,7 +364,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
 
     def _sampleImage(self, img, dx, dy,
                      xlo=None, ylo=None, width=None, height=None):
-        from astrometry.util.util import lanczos3_interpolate_grid
+        from tractor.miscutils import lanczos3_interpolate_grid
         if img is None:
             img = self.img
         if xlo is None:
@@ -307,14 +400,99 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
         dx = px - ix
         dy = py - iy
 
+        scale = 1. / self.sampling**2
         if modelMask is not None:
             mh, mw = modelMask.shape
             mx0, my0 = modelMask.x0, modelMask.y0
             xl,yl,native_img = self._sampleImage(img, dx, dy, xlo=mx0-ix, ylo=my0-iy,
                                                  width=mw, height=mh)
-            return Patch(xl+ix, yl+iy, native_img)
+            return Patch(xl+ix, yl+iy, native_img * scale)
 
-        xl,yl,img = self._sampleImage(img, dx, dy)
+        # Check for integer downsampling
+        factor = 1. / self.sampling
+        is_integer_factor = abs(factor - round(factor)) < 1e-4
+        # Also need input image size to be large enough?
+        # If we use binning, we need to handle edges carefully.
+        # But for now, let's trust _sampleImage fallback if we are close to edge?
+        # Actually _sampleImage handles edges by clamping/padding (in lanczos3_interpolate_grid)
+        # Here we should implement similar robustness.
+
+        # Only use special path if no radius clipping is requested (or if we can handle it)
+        # And if we are not using modelMask (handled above).
+
+        if is_integer_factor and radius is None:
+            k = int(round(factor))
+
+            # Target High Res size
+            target_h = self.nativeH * k
+            target_w = self.nativeW * k
+
+            h, w = img.shape
+
+            # Pad to target size first (centering roughly)
+            # Add margin for shifting
+            margin = int(np.ceil(max(abs(dx * k), abs(dy * k)))) + 10
+
+            canvas_h = max(h, target_h) + 2 * margin
+            canvas_w = max(w, target_w) + 2 * margin
+
+            # Define crop region in center of canvas
+            crop_x0 = (canvas_w - target_w) // 2
+            crop_y0 = (canvas_h - target_h) // 2
+
+            target_center_x_in_canvas = crop_x0 + (target_w - 1) / 2.0
+            target_center_y_in_canvas = crop_y0 + (target_h - 1) / 2.0
+
+            # Desired peak position
+            desired_x = target_center_x_in_canvas + dx * k
+            desired_y = target_center_y_in_canvas + dy * k
+
+            # Place img such that its peak (w//2) is close to desired_x
+            # curr_x = w//2 + pw
+            # pw ~ desired_x - w//2
+            pw = int(round(desired_x - (w // 2)))
+            ph = int(round(desired_y - (h // 2)))
+
+            # Clamp to canvas
+            pw = max(0, min(canvas_w - w, pw))
+            ph = max(0, min(canvas_h - h, ph))
+
+            pad_img = np.zeros((canvas_h, canvas_w), dtype=img.dtype)
+            pad_img[ph:ph+h, pw:pw+w] = img
+
+            curr_x = (w // 2) + pw
+            curr_y = (h // 2) + ph
+
+            shift_x = desired_x - curr_x
+            shift_y = desired_y - curr_y
+
+            shifted = lanczos_shift_image(pad_img, shift_x, shift_y)
+
+            # Crop to target size
+            crop = shifted[crop_y0 : crop_y0 + target_h, crop_x0 : crop_x0 + target_w]
+
+            # Binning
+            crop = crop.reshape(self.nativeH, k, self.nativeW, k)
+            downsampled = crop.sum(axis=(1, 3))
+
+            # Adjust scaling.
+            # We want to return something that, when multiplied by 'scale' (k^2), gives the Flux.
+            # 'downsampled' IS the Flux (sum).
+            # So we return downsampled / k^2.
+            img = downsampled / (k**2)
+
+            # Calculate xl, yl
+            # The patch is centered at (ix, iy).
+            # Size (nativeW, nativeH).
+            # xl = -nativeW // 2
+            # yl = -nativeH // 2
+            xl = -(self.nativeW // 2)
+            yl = -(self.nativeH // 2)
+
+        else:
+            xl,yl,img = self._sampleImage(img, dx, dy)
+
+        img *= scale
         x0 = ix + xl
         y0 = iy + yl
 
@@ -434,6 +612,43 @@ class GaussianMixturePSF(MogParams, ducks.ImageCalibration):
         meig = max([max(abs(numpy.linalg.eigvalsh(v)))
                     for v in self.mog.var])
         return self.getNSigma() * np.sqrt(meig)
+
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius using an analytic Gaussian approximation.
+        r_eff = max_k ( sigma_scale * sqrt(lambda_max_k) )
+        where sigma_scale = sqrt(2 * ln(1/(1-f)))
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        # Calculate sigma scale factor
+        # f = 1 - exp(-r^2 / (2sigma^2))
+        # 1-f = exp(...)
+        # ln(1-f) = -r^2 / 2sigma^2
+        # r^2 = -2sigma^2 ln(1-f)
+        # r = sigma * sqrt(-2 ln(1-f))
+
+        sigma_scale = np.sqrt(-2.0 * np.log(1.0 - flux_fraction))
+
+        import numpy.linalg
+        max_r = 0.0
+
+        for k in range(len(self.mog.amp)):
+            v = self.mog.var[k]
+            # Max eigenvalue (variance along major axis)
+            lambda_max = max(abs(numpy.linalg.eigvalsh(v)))
+            sigma = np.sqrt(lambda_max)
+            r = sigma * sigma_scale
+            if r > max_r:
+                max_r = r
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = max_r
+
+        return max_r
 
     def getNSigma(self):
         # MAGIC -- N sigma for rendering patches
@@ -882,6 +1097,28 @@ class NCircularGaussianPSF(MultiParams, ducks.ImageCalibration):
             return self.radius
         return max(self.minradius, max(self.mysigmas) * self.getNSigma())
 
+    def get_r_eff(self, flux_fraction=0.999):
+        """
+        Computes the effective radius.
+        """
+        cache_key = ('r_eff', flux_fraction)
+        if hasattr(self, '_r_eff_cache') and cache_key in self._r_eff_cache:
+            return self._r_eff_cache[cache_key]
+
+        sigma_scale = np.sqrt(-2.0 * np.log(1.0 - flux_fraction))
+
+        max_r = 0.0
+        for s in self.mysigmas:
+            r = s * sigma_scale
+            if r > max_r:
+                max_r = r
+
+        if not hasattr(self, '_r_eff_cache'):
+            self._r_eff_cache = {}
+        self._r_eff_cache[cache_key] = max_r
+
+        return max_r
+
     # returns a Patch object.
     def getPointSourcePatch(self, px, py, minval=0., radius=None,
                             modelMask=None, clipExtent=None, **kwargs):
@@ -930,3 +1167,30 @@ try:
     getCircularMog = functools.lru_cache(maxsize=16)(getCircularMog)
 except:
     pass
+
+# mixin class
+class NormalizedPsf(object):
+    def getFourierTransform(self, px, py, radius):
+        fft, (cx,cy), shape, (v,w) = super().getFourierTransform(px, py, radius)
+        n = np.abs(fft[0][0])
+        if n != 0:
+            fft /= n
+        return fft, (cx,cy), shape, (v,w)
+
+    def getImage(self, px, py):
+        img = super().getImage(px, py)
+        n = np.sum(img)
+        if n != 0:
+            img /= n
+        return img
+
+    def _sampleImage(self, img, dx, dy, **kwargs):
+        xl,yl,img = super()._sampleImage(img, dx, dy, **kwargs)
+        n = img.sum()
+        if n != 0:
+            img /= n
+        return xl,yl,img
+
+class NormalizedPixelizedPsf(NormalizedPsf, PixelizedPSF):
+    def __str__(self):
+        return 'NormalizedPixelizedPsf'

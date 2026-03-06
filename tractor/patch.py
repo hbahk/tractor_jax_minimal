@@ -83,6 +83,7 @@ class Patch(object):
         self.x0 = x0
         self.y0 = y0
         self.patch = patch
+        self.patch_gpu = None
         self.name = ''
         if patch is not None:
             try:
@@ -212,13 +213,34 @@ class Patch(object):
         return (self.x0 - margin, self.x0 + w + margin,
                 self.y0 - margin, self.y0 + h + margin)
 
+    @property
+    def extent(self):
+        (h, w) = self.shape
+        return (self.x0, self.x0 + w, self.y0, self.y0 + h)
+
+    @property
+    def shape(self):
+        if self.patch is None:
+            return 0,0
+        return self.patch.shape
+
     def getOrigin(self):
         return (self.x0, self.y0)
 
-    def getPatch(self):
+    def getPatch(self, use_gpu=False):
+        if use_gpu:
+            if self.patch_gpu is None:
+                import cupy as cp
+                self.patch_gpu = cp.asarray(self.patch)
+            return self.patch_gpu
         return self.patch
 
-    def getImage(self):
+    def getImage(self, use_gpu=False):
+        if use_gpu:
+            if self.patch_gpu is None:
+                import cupy as cp
+                self.patch_gpu = cp.asarray(self.patch)
+            return self.patch_gpu
         return self.patch
 
     def getX0(self):
@@ -227,7 +249,8 @@ class Patch(object):
     def getY0(self):
         return self.y0
 
-    def clipTo(self, W, H):
+    def clipTo(self, W, H, use_gpu=False):
+        from tractor.miscutils import get_overlapping_region
         if self.patch is None:
             return False
         if self.x0 >= W:
@@ -241,9 +264,13 @@ class Patch(object):
         #o0 = (self.x0, self.y0, self.patch.shape)
         if self.x0 < 0:
             self.patch = self.patch[:, -self.x0:]
+            if use_gpu:
+                self.patch_gpu = self.patch_gpu[:, -self.x0:]
             self.x0 = 0
         if self.y0 < 0:
             self.patch = self.patch[-self.y0:, :]
+            if use_gpu:
+                self.patch_gpu = self.patch_gpu[-self.y0:, :]
             self.y0 = 0
         # debug
         # S = self.patch.shape
@@ -255,8 +282,12 @@ class Patch(object):
         (h, w) = self.patch.shape
         if (self.x0 + w) > W:
             self.patch = self.patch[:, :(W - self.x0)]
+            if use_gpu:
+                self.patch_gpu = self.patch_gpu[:, :(W - self.x0)]
         if (self.y0 + h) > H:
             self.patch = self.patch[:(H - self.y0), :]
+            if use_gpu:
+                self.patch_gpu = self.patch_gpu[:(H - self.y0), :]
 
         assert(self.x0 >= 0)
         assert(self.y0 >= 0)
@@ -306,7 +337,7 @@ class Patch(object):
         Returns (spatch, sparent), slices that yield the overlapping regions
         in this Patch and the given image.
         '''
-        from astrometry.util.miscutils import get_overlapping_region
+        from tractor.miscutils import get_overlapping_region
         (ph, pw) = self.shape
         (ih, iw) = shape
         (outx, inx) = get_overlapping_region(
@@ -317,7 +348,19 @@ class Patch(object):
             return (slice(0, 0), slice(0, 0)), (slice(0, 0), slice(0, 0))
         return (iny, inx), (outy, outx)
 
-    def getPixelIndices(self, parent, dtype=np.int32):
+    def getPixelIndicesGPU(self, parent, dtype=np.int32):
+        import jax.numpy as jnp
+        return jnp.asarray(self.getPixelIndices(parent, dtype))
+
+    def getPixelIndices(self, parent, dtype=np.int32, use_gpu=False):
+        if use_gpu:
+            import jax.numpy as jnp
+            if self.patch is None:
+                return jnp.array([], dtype)
+            (h, w) = self.shape
+            (H, W) = parent.shape
+            return ( (jnp.arange(w, dtype=dtype) + dtype(self.x0))[jnp.newaxis, :] +
+                ((jnp.arange(h, dtype=dtype) + dtype(self.y0)) * dtype(W))[:, jnp.newaxis]).ravel()
         if self.patch is None:
             return np.array([], dtype)
         (h, w) = self.shape
@@ -328,9 +371,9 @@ class Patch(object):
     plotnum = 0
 
     def addTo(self, img, scale=1.):
-        from astrometry.util.miscutils import get_overlapping_region
+        from tractor.miscutils import get_overlapping_region
         if self.patch is None:
-            return
+            return img
         (ih, iw) = img.shape
         (ph, pw) = self.shape
         (outx, inx) = get_overlapping_region(
@@ -338,9 +381,17 @@ class Patch(object):
         (outy, iny) = get_overlapping_region(
             self.y0, self.y0 + ph - 1, 0, ih - 1)
         if inx == [] or iny == []:
-            return
+            return img
         p = self.patch[iny, inx]
-        img[outy, outx] += p * scale
+
+        # JAX-compatible update
+        # Check if img is a JAX array
+        if hasattr(img, 'at'):
+            return img.at[outy, outx].add(p * scale)
+        else:
+            # Fallback for numpy arrays (legacy support)
+            img[outy, outx] += p * scale
+            return img
 
         # if False:
         #   tmpimg = np.zeros_like(img)
@@ -362,13 +413,6 @@ class Patch(object):
         #   print 'Wrote', fn
         #
         #   Patch.plotnum += 1
-
-    def __getattr__(self, name):
-        if name == 'shape':
-            if self.patch is None:
-                return (0, 0)
-            return self.patch.shape
-        raise AttributeError('Patch: unknown attribute "%s"' % name)
 
     # Implement *=, /= for numeric types
     def __imul__(self, f):

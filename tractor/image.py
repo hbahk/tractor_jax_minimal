@@ -1,7 +1,6 @@
-from __future__ import print_function
 import numpy as np
 from tractor.utils import MultiParams, _isint, listmax, get_class_from_name
-
+import traceback
 
 class Image(MultiParams):
     '''
@@ -18,7 +17,6 @@ class Image(MultiParams):
         '''
         Args:
           * *data*: numpy array: the image pixels
-          * *invvar*: numpy array: the image inverse-variance
           * *inverr*: numpy array: the image inverse-error
           * *psf*: a :class:`tractor.PSF` duck
           * *wcs*: a :class:`tractor.WCS` duck
@@ -27,20 +25,18 @@ class Image(MultiParams):
           * *name*: string name of this image.
           * *zr*: plotting range ("vmin"/"vmax" in matplotlib.imshow)
 
-        Only one of *invvar* and *inverr* should be given.  If both
-        are given, inverr takes precedent.
-
         If *wcs* is not given, assumes pixel space.
 
         If *sky* is not given, assumes zero sky.
 
         If *photocal* is not given, assumes count units.
         '''
+        # deprecated
+        assert(invvar is None)
+
         self.data = data
         if inverr is not None:
             self.inverr = inverr
-        elif invvar is not None:
-            self.setInvvar(invvar)
 
         self.name = name
         self.zr = kwargs.pop('zr', None)
@@ -81,7 +77,7 @@ class Image(MultiParams):
 
     def subimage(self, x0, x1, y0, y1):
         slc = (slice(y0, y1), slice(x0, x1))
-        subtim = Image(data=self.data[slc].copy(),
+        subtim = self.__class__(data=self.data[slc].copy(),
                        inverr=self.inverr[slc].copy(),
                        wcs=self.wcs.shifted(x0, y0),
                        psf=self.psf.getShifted(x0, y0),
@@ -110,13 +106,11 @@ class Image(MultiParams):
         derivs = []
         for s in self._getActiveSubs():
             if hasattr(s, 'getParamDerivatives'):
-                #print('Calling getParamDerivatives on', s)
                 sd = s.getParamDerivatives(tractor, self, srcs)
                 assert(len(sd) == s.numberOfParams())
                 derivs.extend(sd)
             else:
                 derivs.extend([False] * s.numberOfParams())
-        # print('Image.getParamDerivatives: returning', derivs)
         return derivs
 
     def getSky(self):
@@ -131,10 +125,6 @@ class Image(MultiParams):
     @property
     def shape(self):
         return self.getShape()
-
-    @property
-    def invvar(self):
-        return self.inverr**2
 
     # Numpy arrays have shape H,W
     def getWidth(self):
@@ -152,28 +142,20 @@ class Image(MultiParams):
         return self.getShape()
 
     def hashkey(self):
-        return ('Image', id(self.data), id(self.inverr), self.psf.hashkey(),
+        return (self.__class__.name, id(self.data), id(self.inverr), self.psf.hashkey(),
                 self.sky.hashkey(), self.wcs.hashkey(),
                 self.photocal.hashkey())
 
     def numberOfPixels(self):
-        (H, W) = self.data.shape
-        return W * H
+        #(H, W) = self.data.shape
+        #return W * H
+        return self.data.size
 
     def getInvError(self):
         return self.inverr
 
     def setInvError(self, inverr):
         self.inverr = inverr
-
-    def getInvvar(self):
-        return self.inverr**2
-
-    def setInvvar(self, iv):
-        # work around https://github.com/numpy/numpy/issues/11448
-        # (intel mkl / intel-numpy bug)
-        with np.errstate(invalid='ignore'):
-            self.inverr = np.sqrt(iv)
 
     def getImage(self):
         return self.data
@@ -212,7 +194,7 @@ class Image(MultiParams):
         sky = readObject(prefix + 'SKY')
         pcal = readObject(prefix + 'PHO')
 
-        return Image(data=pix, invvar=iv, psf=psf, wcs=wcs, sky=sky,
+        return Image(data=pix, inverr=np.sqrt(iv), psf=psf, wcs=wcs, sky=sky,
                      photocal=pcal)
 
     def toFits(self, fits, prefix='', primheader=None, imageheader=None,
@@ -220,7 +202,7 @@ class Image(MultiParams):
         hdr = self.getFitsHeader(header=primheader, prefix=prefix)
         fits.write(None, header=hdr)
         fits.write(self.getImage(), header=imageheader)
-        fits.write(self.getInvvar(), header=invvarheader)
+        fits.write(self.getInvError()**2, header=invvarheader)
 
     def getFitsHeader(self, header=None, prefix=''):
         psf = self.getPsf()

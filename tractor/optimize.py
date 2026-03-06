@@ -1,6 +1,6 @@
 from __future__ import print_function
 import numpy as np
-from astrometry.util.ttime import Time
+from tractor.tractortime import TAITime as Time
 from tractor.engine import logverb, OptResult, logmsg
 
 
@@ -423,6 +423,7 @@ class Optimizer(object):
         return IV
 
     def tryUpdates(self, tractor, X, alphas=None):
+        #print ("ORIG UPDATES")
         if alphas is None:
             # 1/1024 to 1 in factors of 2, + sqrt(2.) + 2.
             alphas = np.append(2.**np.arange(-10, 1), [np.sqrt(2.), 2.])

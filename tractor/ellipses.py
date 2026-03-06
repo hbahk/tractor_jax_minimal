@@ -9,7 +9,7 @@ if __name__ == '__main__':
 import math
 import numpy as np
 
-from tractor import ParamList
+from tractor.utils import ParamList
 
 
 class EllipseE(ParamList):
@@ -200,8 +200,13 @@ class EllipseESoft(EllipseE):
     def fromEllipseE(ell, maxe=0.999999):
         e = ell.e
         e = min(e, maxe)
-        esoft = -math.log(1. - e)
-        return EllipseESoft(math.log(ell.re), ell.e1 / e * esoft, ell.e2 / e * esoft)
+        if e == 0:
+            e1 = e2 = 0.
+        else:
+            esoft = -math.log(1. - e)
+            e1 = ell.e1 / e * esoft
+            e2 = ell.e2 / e * esoft
+        return EllipseESoft(math.log(ell.re), e1, e2)
 
     @staticmethod
     def fromCovariance(cov):

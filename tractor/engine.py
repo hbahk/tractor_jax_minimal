@@ -16,6 +16,9 @@ import numpy as np
 from tractor.utils import MultiParams, _isint, get_class_from_name
 from tractor.patch import Patch, ModelMask
 from tractor.image import Image
+from tractor.utils import savetxt_cpu_append
+
+import time
 
 logger = logging.getLogger('tractor.engine')
 def logverb(*args):
@@ -117,6 +120,7 @@ class Tractor(MultiParams):
         - `images:` list of Image objects (data)
         - `catalog:` list of Source objects
         '''
+        self.blobid = None
         if images is None:
             images = []
         if catalog is None:
@@ -185,8 +189,15 @@ class Tractor(MultiParams):
     def getImages(self):
         return self.images
 
+    def getImagesGPU(self):
+        import jax.numpy as cp
+        return [cp.asarray(im) for im in self.images]
+
     def getCatalog(self):
         return self.catalog
+
+    def setBlobid(self, blobid):
+        self.blobid = blobid
 
     def setCatalog(self, srcs):
         # FIXME -- ensure that "srcs" is a Catalog?  Or duck-type it?
@@ -274,6 +285,7 @@ class Tractor(MultiParams):
         '''
         kw = self.model_kwargs.copy()
         kw.update(kwargs)
+        #print ("OPTIMIZER = ", self.optimizer, self.optimizer.optimize_loop)
         return self.optimizer.optimize_loop(self, **kw)
 
     def getDerivs(self, **kwargs):
@@ -291,6 +303,7 @@ class Tractor(MultiParams):
         Where the *derivs* are *Patch* objects and *imgs* are *Image*
         objects.
         '''
+        t = time.time()
         allderivs = []
 
         if self.isParamFrozen('catalog'):
@@ -302,10 +315,12 @@ class Tractor(MultiParams):
 
         kw = self.model_kwargs.copy()
         kw.update(kwargs)
+        #print ("TEST1")
 
         if not self.isParamFrozen('images'):
             for i in self.images.getThawedParamIndices():
                 img = self.images[i]
+                #print ("IMG", img)
                 derivs = img.getParamDerivatives(self, allsrcs, **kw)
                 mod0 = None
                 for di, deriv in enumerate(derivs):
@@ -323,9 +338,11 @@ class Tractor(MultiParams):
                     allderivs.append([(deriv, img)])
                 del mod0
 
+        #print ("TEST2")
         for src in srcs:
             srcderivs = [[] for i in range(src.numberOfParams())]
             for img in self.images:
+                #print ("IMG2", img)
                 derivs = self._getSourceDerivatives(src, img, **kwargs)
                 for k, deriv in enumerate(derivs):
                     if deriv is None:
@@ -360,6 +377,14 @@ class Tractor(MultiParams):
         assert((masks is None) or (len(masks) == len(self.images)))
         self.expectModelMasks = (masks is not None) and assumeMasks
 
+    def _getModelMaskByIdx(self, idx, src):
+        if self.modelMasks is None:
+            return None
+        try:
+            return self.modelMasks[idx][src]
+        except KeyError:
+            return None
+
     def _getModelMaskFor(self, image, src):
         if self.modelMasks is None:
             return None
@@ -392,6 +417,7 @@ class Tractor(MultiParams):
         # HACK! -- assume no modelMask -> no overlap
         if self.expectModelMasks and mask is None:
             return [None] * src.numberOfParams()
+        #print ("D1", src.getParamDerivatives)
         derivs = src.getParamDerivatives(img, modelMask=mask, **kwargs)
 
         # HACK -- auto-add?
@@ -441,22 +467,49 @@ class Tractor(MultiParams):
             patch = self.getModelPatch(img, src, minsb=minsb, **kwargs)
             if patch is None:
                 continue
-            patch.addTo(mod)
+            mod = patch.addTo(mod)
         return mod
 
     def getModelImages(self, **kwargs):
         for img in self.images:
             yield self.getModelImage(img, **kwargs)
 
+    def getChiImagesGPU(self, **kwargs):
+        for img in self.images:
+            yield self.getChiImageGPU(img=img, **kwargs)
+
     def getChiImages(self, **kwargs):
         for img in self.images:
             yield self.getChiImage(img=img, **kwargs)
+
+    def getChiImageGPU(self, imgi=-1, img=None, srcs=None, minsb=0., **kwargs):
+        import jax.numpy as cp
+        gi = cp.asarray(self.getChiImage(imgi, img, srcs, minsb, **kwargs))
+        """
+        TODO: In future use factored_optimizer helpers to get chi2
+        if img is None:
+            img = self.getImage(imgi)
+        gtl[0] += time.time()-t
+        t = time.time()
+        mod = self.getModelImage(img, srcs=srcs, minsb=minsb, **kwargs)
+        gtl[1] += time.time()-t
+        t = time.time()
+        chi = (img.getImage(use_gpu=True) - cp.asarray(mod)) * img.getInvError(use_gpu=True)
+        gtl[2] += time.time()-t
+        if not np.all(np.isfinite(chi)):
+            print('ERROR: Chi not finite')
+        return chi
+        """
+        return gi
 
     def getChiImage(self, imgi=-1, img=None, srcs=None, minsb=0., **kwargs):
         if img is None:
             img = self.getImage(imgi)
         mod = self.getModelImage(img, srcs=srcs, minsb=minsb, **kwargs)
         chi = (img.getImage() - mod) * img.getInvError()
+        #savetxt_cpu_append('cmod.txt', mod)
+        #savetxt_cpu_append('cie.txt', img.getInvError())
+        #savetxt_cpu_append('cpix.txt', img.getImage())
         if not np.all(np.isfinite(chi)):
             print('Chi not finite')
             print('Image finite?', np.all(np.isfinite(img.getImage())))
@@ -472,11 +525,38 @@ class Tractor(MultiParams):
             print('psf:', img.getPsf())
         return chi
 
+    def getLogLikelihoodGPU(self, **kwargs):
+        chisq = 0.
+        for i, chi in enumerate(self.getChiImagesGPU(**kwargs)):
+            chisq += (chi.astype(float) ** 2).sum()
+        return -0.5 * chisq
+
     def getLogLikelihood(self, **kwargs):
         chisq = 0.
         for i, chi in enumerate(self.getChiImages(**kwargs)):
             chisq += (chi.astype(float) ** 2).sum()
         return -0.5 * chisq
+
+    def getLogProbGPU(self, **kwargs):
+        '''
+        Return the posterior log PDF, evaluated at the current parameters.
+        '''
+        import jax.numpy as cp
+        lnprior = self.getLogPrior()
+        if lnprior == -np.inf:
+            return lnprior
+        t = time.time()
+        lnl = self.getLogLikelihoodGPU(**kwargs)
+        #print ("GTL:", gtl, gcl, cl, "GI:", gi)
+        lnp = lnprior + lnl
+        if cp.isnan(lnp):
+            print('Tractor.getLogProb() returning NaN.')
+            print('Params:')
+            self.printThawedParams()
+            print('log likelihood:', lnl)
+            print('log prior:', lnprior)
+            return -np.inf
+        return lnp
 
     def getLogProb(self, **kwargs):
         '''
@@ -486,7 +566,9 @@ class Tractor(MultiParams):
         if lnprior == -np.inf:
             return lnprior
         lnl = self.getLogLikelihood(**kwargs)
+        #print ("TL:", tl, gcl, cl, "GI", gi)
         lnp = lnprior + lnl
+        #print ("LP", lnprior, "LNL", lnl, "LNP", lnp)
         if np.isnan(lnp):
             print('Tractor.getLogProb() returning NaN.')
             print('Params:')
