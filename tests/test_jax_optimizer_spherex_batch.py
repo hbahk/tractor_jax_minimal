@@ -15,7 +15,7 @@ from astropy.io import fits
 from astropy.table import Table
 from astropy.wcs import WCS
 import jax
-jax.config.update("jax_enable_x64", True)
+# jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 from photutils.background import Background2D, MedianBackground
 from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
