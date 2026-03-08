@@ -21,7 +21,10 @@ from photutils.background import Background2D, MedianBackground
 from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
 from tractor.brightness import Flux
 from tractor.wcs import PixPos, AstropyWCS, RaDecPos, AffineWCS
-from tractor.jax.optimizer import JaxOptimizer, extract_model_data, solve_fluxes_core
+from tractor.jax.optimizer import (
+    JaxOptimizer, extract_model_data, solve_fluxes_core,
+    solve_fluxes_linear, extract_model_data_direct,
+)
 from tractor.psf import PixelizedPSF
 import tractor
 from tractor import ConstantSky, Flux, LinearPhotoCal, NullWCS, PixPos, PointSource, RaDecPos
@@ -1188,6 +1191,220 @@ def test_jax_optimizer_spherex_batch(idx_list):
         
     return cutout_info
 
+def _fit_background_for_frame(args):
+    """Worker for parallel background fitting."""
+    img, bkg, flg, var, bkg_model, grid_cache_key = args
+    if bkg_model == "photutils":
+        return fit_background_photutils(
+            img=img, bkg=bkg, flg=flg, var=var,
+            maskbits=MASKBITS,
+            source_bit=(1 << FLAG_BITS["SOURCE"]),
+            box_size=BKG_BOX_SIZE, filter_size=BKG_FILTER_SIZE,
+        )
+    elif bkg_model == "plane":
+        grid = np.indices(img.shape)
+        return fit_background_plane(
+            img=img, bkg=bkg, flg=flg, var=var,
+            maskbits=MASKBITS,
+            source_bit=(1 << FLAG_BITS["SOURCE"]),
+            grid=grid,
+        )
+    return bkg
+
+
+def test_jax_optimizer_spherex_batch_direct(idx_list, hdul, tab, solver="linear"):
+    """
+    Optimized version: builds JAX arrays directly, skipping Tractor objects.
+    Uses direct linear solver by default.
+
+    Args:
+        idx_list: frame indices to process.
+        hdul: already-opened FITS HDUList.
+        tab: catalog table with ra, dec, shape_r, shape_ab, shape_phi, sersic.
+        solver: "linear" or "cg".
+    """
+    start_time = time.time()
+    cutout_info = Table(hdul[1].data)
+    cutout_info["flux"] = np.full(len(cutout_info), np.nan)
+    cutout_info["flux_err"] = np.full(len(cutout_info), np.nan)
+    end_time = time.time()
+    logger.info("Time to read the cutout info: %.6f seconds", end_time - start_time)
+
+    # 1. Load frames and fit backgrounds (parallelized)
+    max_h, max_w = 0, 0
+    max_psf_h, max_psf_w = 0, 0
+
+    logger.info("Loading frames and determining shapes...")
+    bkg_args = []
+    raw_frames = []
+
+    for i in tqdm(idx_list, desc="Reading FITS"):
+        img_idx = 2 + i * 6
+        img = hdul[img_idx].data
+        flg = hdul[img_idx + 1].data
+        var = hdul[img_idx + 2].data
+        bkg = hdul[img_idx + 3].data
+        psf_cube = hdul[img_idx + 4].data
+        psf_lookup = hdul[img_idx + 5].data
+        hdr = hdul[img_idx].header
+
+        max_h = max(max_h, img.shape[0])
+        max_w = max(max_w, img.shape[1])
+
+        gx, gy = cutout_info["x"][i], cutout_info["y"][i]
+        zoneid = get_nearest_psf_zone_index(gx, gy, psf_lookup)
+        zidx = np.where(psf_lookup["zone_id"] == zoneid)[0][0]
+        psf_data = downsample_psf_oversample2(psf_cube[zidx])
+        max_psf_h = max(max_psf_h, psf_data.shape[0])
+        max_psf_w = max(max_psf_w, psf_data.shape[1])
+
+        raw_frames.append({
+            'img': img, 'flg': flg, 'var': var, 'bkg': bkg,
+            'psf': psf_data, 'hdr': hdr, 'idx': i,
+        })
+        bkg_args.append((img, bkg, flg, var, BKG_MODEL, img.shape))
+
+    # Parallel background fitting
+    logger.info("Fitting backgrounds (parallel)...")
+    start_time = time.time()
+    if BKG_MODEL != "none":
+        max_workers = min(len(bkg_args), os.cpu_count() or 1, 10)
+        mp_context = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=mp_context) as executor:
+            fitted_bkgs = list(tqdm(
+                executor.map(_fit_background_for_frame, bkg_args),
+                total=len(bkg_args), desc="Background"
+            ))
+        for k, bkg_fitted in enumerate(fitted_bkgs):
+            raw_frames[k]['bkg'] = bkg_fitted
+    end_time = time.time()
+    logger.info("Time to fit backgrounds: %.6f seconds", end_time - start_time)
+
+    # 2. Preprocess frames into direct arrays
+    logger.info("Preprocessing frames into JAX arrays...")
+    start_time = time.time()
+
+    psf_sampling = 0.2
+    fixed_max_factor = 5.0
+    fft_pad_h_lr = int(math.ceil(max_psf_h / fixed_max_factor))
+    fft_pad_w_lr = int(math.ceil(max_psf_w / fixed_max_factor))
+    padded_h = max_h + fft_pad_h_lr
+    padded_w = max_w + fft_pad_w_lr
+    fixed_target_shape = (
+        int(round(padded_h * fixed_max_factor)),
+        int(round(padded_w * fixed_max_factor)),
+    )
+    logger.info("Fixed target shape: %s, max_factor: %s", fixed_target_shape, fixed_max_factor)
+
+    direct_frames = []
+    for fr in raw_frames:
+        img = fr['img']
+        flg = fr['flg']
+        var = fr['var']
+        bkg = fr['bkg']
+        hdr = fr['hdr']
+
+        wcs = WCS(hdr)
+        omega_sr = _pixel_area_sr(wcs, img.shape).astype(img.dtype, copy=False)
+        img_scaled = img * omega_sr * IMG_SCALE
+        bkg_scaled = bkg * omega_sr * IMG_SCALE
+        var_scaled = var * (omega_sr ** 2) * (IMG_SCALE ** 2)
+
+        invvar = 1.0 / var_scaled
+        invvar[~np.isfinite(invvar)] = 0
+        mask = flg & MASKBITS != 0
+        invvar[mask] = 0
+
+        data = pad_array(img_scaled - bkg_scaled, (padded_h, padded_w))
+        data = np.where(np.isfinite(data), data, 0.0)
+        invvar_pad = pad_array(invvar, (padded_h, padded_w))
+
+        psf_pad = pad_array(fr['psf'], (max_psf_h, max_psf_w))
+
+        direct_frames.append({
+            'data': data,
+            'invvar': invvar_pad,
+            'psf': psf_pad,
+            'wcs': wcs,
+        })
+
+    images_data, batches, initial_fluxes = extract_model_data_direct(
+        direct_frames,
+        tab,
+        psf_sampling=psf_sampling,
+        fit_background=True,
+        fixed_target_shape=fixed_target_shape,
+        fixed_max_factor=fixed_max_factor,
+        profile_lookup_fn=SersicMixture.getProfile,
+    )
+    end_time = time.time()
+    logger.info("Time to preprocess + extract: %.6f seconds", end_time - start_time)
+
+    # 3. Run optimization
+    logger.info("Running JAX optimization (solver=%s)...", solver)
+    start_time = time.time()
+
+    sample_batches = batches
+    batches_in_axes = {}
+    if "PointSource" in sample_batches:
+        batches_in_axes["PointSource"] = {
+            "flux_idx": 0, "pos_pix": 0, "mask": 0,
+        }
+    if "Galaxy" in sample_batches:
+        batches_in_axes["Galaxy"] = {
+            "flux_idx": 0, "pos_pix": 0, "wcs_cd_inv": 0,
+            "mask": 0, "shapes": 0,
+            "profile": {"amp": 0, "mean": 0, "var": 0},
+        }
+    if "Background" in sample_batches:
+        batches_in_axes["Background"] = {"flux_idx": None}
+
+    if solver == "linear":
+        solve_fn = partial(solve_fluxes_linear, return_variances=True)
+    else:
+        solve_fn = partial(solve_fluxes_core, return_variances=True, use_preconditioner=False)
+
+    solve_vmap = jax.jit(jax.vmap(solve_fn, in_axes=(0, 0, batches_in_axes)))
+    fluxes_stack, variances_stack = solve_vmap(initial_fluxes, images_data, batches)
+
+    end_time = time.time()
+    logger.info("Time to optimize fluxes: %.6f seconds", end_time - start_time)
+
+    # 4. Diagnostics (simplified)
+    f_np = np.array(fluxes_stack)
+    v_np = np.array(variances_stack)
+
+    nan_flux = np.isnan(f_np)
+    inf_flux = np.isinf(f_np)
+    nan_var = np.isnan(v_np)
+    inf_var = np.isinf(v_np)
+    neg_flux = f_np < 0.0
+
+    logger.info("=== Diagnostics ===")
+    logger.info("fluxes   — NaN: %d  Inf: %d  Negative: %d  (out of %d)",
+                nan_flux.sum(), inf_flux.sum(), neg_flux.sum(), f_np.size)
+    logger.info("variances — NaN: %d  Inf: %d",
+                nan_var.sum(), inf_var.sum())
+
+    # Find main source
+    gra, gdec = 258.2084186 * u.deg, 64.0529535 * u.deg
+    gco = SkyCoord(ra=gra, dec=gdec)
+    sc = SkyCoord(ra=tab["ra"], dec=tab["dec"], unit="deg")
+    sep = sc.separation(gco)
+    main_idx = np.argmin(sep)
+
+    flux = f_np[:, main_idx]
+    ferr = np.sqrt(np.clip(v_np[:, main_idx], 0, None))
+
+    logger.info("Main flux sample: %s", flux[:5])
+
+    for k, i in enumerate(idx_list):
+        cutout_info["flux"][i] = flux[k]
+        cutout_info["flux_err"][i] = ferr[k]
+
+    return cutout_info
+
+
 if __name__ == "__main__":
     from tractor.jax.tree import register_pytree_nodes
     logging.basicConfig(
@@ -1201,23 +1418,42 @@ if __name__ == "__main__":
 
     start_time = time.time()
 
-    # test_index = np.arange(0, 3000, 30)
-    # Check if files exist to avoid error
     import os
     if os.path.exists("tests/testphot.fits"):
         hdul = fits.open("tests/testphot.fits")
         cutout_info = Table(hdul[1].data)
         cutout_info["flux"] = np.full(len(cutout_info), np.nan)
         cutout_info["flux_err"] = np.full(len(cutout_info), np.nan)
+
+        tab = Table.read("tests/ls_testgal.parquet")
+        tco = SkyCoord(ra=tab["ra"], dec=tab["dec"], unit="deg")
+        e1, e2 = tab["shape_e1"], tab["shape_e2"]
+        e = np.hypot(e1, e2)
+        ab = (1 - e) / (1 + e)
+        phi = 0.5 * np.rad2deg(np.arctan2(e2, e1))
+        phi = (phi + 180.0) % 180.0
+        tab["shape_phi"] = phi
+        tab["shape_ab"] = ab
+
         test_index = np.arange(len(cutout_info))
-        batch_size = 500
+        batch_size = 1000
+
+        # Use optimized direct path by default
+        USE_DIRECT = True
+        SOLVER = "linear"  # "linear" or "cg"
+
         for i in range(0, len(test_index), batch_size):
-        # for i in range(1000, 2000, batch_size):
             batch_index = test_index[i:i+batch_size]
-            batch_cutout_info = test_jax_optimizer_spherex_batch(batch_index)
+            if USE_DIRECT:
+                batch_cutout_info = test_jax_optimizer_spherex_batch_direct(
+                    batch_index, hdul, tab, solver=SOLVER
+                )
+            else:
+                batch_cutout_info = test_jax_optimizer_spherex_batch(batch_index)
             cutout_info["flux"][batch_index] = batch_cutout_info["flux"][batch_index]
             cutout_info["flux_err"][batch_index] = batch_cutout_info["flux_err"][batch_index]
 
+        hdul.close()
         cutout_info.write("tests/test_jax_optimizer_spherex_batch.parquet", overwrite=True)
 
         if os.path.exists("/data1/hbahk/spherex-cluster/codes/realworld/specphot_results_testgal_a2255_b.parquet"):

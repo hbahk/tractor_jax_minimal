@@ -703,6 +703,254 @@ def extract_model_data(
     return images_data, batches, jnp.array(initial_fluxes_matrix, dtype=jnp.float32)
 
 
+def extract_model_data_direct(
+    frames,
+    catalog_table,
+    psf_sampling,
+    fit_background=False,
+    fixed_target_shape=None,
+    fixed_max_factor=None,
+    profile_lookup_fn=None,
+):
+    """
+    Build JAX arrays directly from raw frame data and a catalog table,
+    bypassing Tractor/Image/Source object construction.
+
+    Args:
+        frames: list of dicts, each with keys:
+            'data': 2-D ndarray, background-subtracted image
+            'invvar': 2-D ndarray, inverse-variance
+            'psf': 2-D ndarray, pixelized PSF image
+            'wcs': astropy.wcs.WCS object
+        catalog_table: astropy Table (or similar) with columns:
+            'ra', 'dec', 'shape_r', 'shape_ab', 'shape_phi', 'sersic'
+            (shape_r == 0 marks point sources).
+        psf_sampling: float, pixel scale of PSF relative to science pixel
+            (e.g. 0.2 means PSF is oversampled 5x).
+        fit_background: bool.
+        fixed_target_shape: (H, W) for the padded rendering grid.
+        fixed_max_factor: float, oversampling factor.
+        profile_lookup_fn: callable(sersic_index) -> MoG object with
+            .amp, .mean, .var attributes.  Required if catalog has galaxies.
+
+    Returns:
+        Same (images_data, batches, initial_fluxes) tuple as extract_model_data.
+    """
+    from astropy.coordinates import SkyCoord
+
+    N_img = len(frames)
+    max_factor = fixed_max_factor if fixed_max_factor is not None else (1.0 / psf_sampling if psf_sampling < 1.0 else 1.0)
+    target_sampling = float(max_factor) if max_factor > 1.0 else 1.0
+
+    if fixed_target_shape is not None:
+        target_H, target_W = fixed_target_shape
+        padded_H = int(math.floor(target_H / max_factor))
+        padded_W = int(math.floor(target_W / max_factor))
+    else:
+        max_H = max(f['data'].shape[0] for f in frames)
+        max_W = max(f['data'].shape[1] for f in frames)
+        max_psf_h = max(f['psf'].shape[0] for f in frames)
+        max_psf_w = max(f['psf'].shape[1] for f in frames)
+        fft_pad_h_lr = int(math.ceil(max_psf_h / max_factor))
+        fft_pad_w_lr = int(math.ceil(max_psf_w / max_factor))
+        padded_H = max_H + fft_pad_h_lr
+        padded_W = max_W + fft_pad_w_lr
+        target_H = int(round(padded_H * max_factor))
+        target_W = int(round(padded_W * max_factor))
+
+    # Pre-scan catalog for max MoG K
+    max_gal_mog_K = 1
+    for row in catalog_table:
+        if row['shape_r'] > 0 and profile_lookup_fn is not None:
+            prof = profile_lookup_fn(row['sersic'])
+            max_gal_mog_K = max(max_gal_mog_K, len(prof.amp))
+
+    # Source positions in sky
+    sco = SkyCoord(ra=catalog_table['ra'], dec=catalog_table['dec'], unit='deg')
+
+    # ---- Build per-image stacks ----
+    data_list, invvar_list = [], []
+    psf_fft_list = []
+
+    ps_flux_list, ps_pos_list = [], []
+    gal_flux_list, gal_pos_list, gal_cd_list = [], [], []
+    gal_shape_list, gal_prof_list = [], []
+
+    src_fluxes = []
+    cat_idx_to_flux_idx = {}
+    for ci, row in enumerate(catalog_table):
+        cat_idx_to_flux_idx[ci] = len(src_fluxes)
+        src_fluxes.append(0.0)
+
+    for i_img in range(N_img):
+        fr = frames[i_img]
+        d = fr['data']
+        iv = fr['invvar']
+        psf_img = fr['psf']
+        wcs_obj = fr['wcs']
+        h, w = d.shape
+
+        pad_h = padded_H - h
+        pad_w = padded_W - w
+        d_pad = jnp.pad(jnp.array(d), ((0, pad_h), (0, pad_w)), constant_values=0.0)
+        iv_pad = jnp.pad(jnp.array(iv), ((0, pad_h), (0, pad_w)), constant_values=0.0)
+        data_list.append(d_pad)
+        invvar_list.append(iv_pad)
+
+        # PSF FFT
+        ph, pw = psf_img.shape
+        raw_psf = jnp.array(psf_img)
+        local_factor = 1.0 / psf_sampling if psf_sampling < 1.0 else 1.0
+        if abs(local_factor - target_sampling) > 1e-3:
+            ratio = target_sampling / local_factor
+            new_shape = (int(round(ph * ratio)), int(round(pw * ratio)))
+            resized = jax.image.resize(raw_psf, new_shape, method='lanczos3')
+            resized = resized * (jnp.sum(raw_psf) / jnp.sum(resized))
+            raw_psf = resized
+            ph, pw = raw_psf.shape
+
+        pad_psf = jnp.zeros((target_H, target_W))
+        cy, cx = target_H // 2, target_W // 2
+        y0 = cy - ph // 2
+        x0 = cx - pw // 2
+        pad_psf = pad_psf.at[y0:y0 + ph, x0:x0 + pw].set(raw_psf)
+        pad_psf = jnp.fft.ifftshift(pad_psf)
+        psf_fft_list.append(jfft.rfft2(pad_psf))
+
+        # Source pixel positions for this frame
+        pxs, pys = wcs_obj.world_to_pixel(sco)
+
+        ps_flux_img, ps_pos_img = [], []
+        gal_flux_img, gal_pos_img, gal_cd_img = [], [], []
+        gal_shape_img, gal_prof_img = [], []
+
+        for ci, row in enumerate(catalog_table):
+            px, py = float(pxs[ci]), float(pys[ci])
+            f_idx = cat_idx_to_flux_idx[ci]
+
+            if i_img == 0:
+                ix, iy = int(round(px)), int(round(py))
+                if 0 <= iy < h and 0 <= ix < w:
+                    raw_val = float(d[iy, ix])
+                    src_fluxes[f_idx] = raw_val if np.isfinite(raw_val) else 0.0
+
+            if row['shape_r'] == 0:
+                ps_flux_img.append(f_idx)
+                ps_pos_img.append([px, py])
+            else:
+                gal_flux_img.append(f_idx)
+                gal_pos_img.append([px, py])
+                # Approximate CD inverse from WCS at source position
+                try:
+                    cd_matrix = np.array(wcs_obj.wcs.cd) if hasattr(wcs_obj.wcs, 'cd') else np.array(wcs_obj.pixel_scale_matrix)
+                except Exception:
+                    cd_matrix = np.eye(2) * (6.15 / 3600.0)
+                cd_inv = np.linalg.inv(cd_matrix)
+                gal_cd_img.append(cd_inv)
+                gal_shape_img.append([row['shape_r'], row['shape_ab'], row['shape_phi']])
+
+                if profile_lookup_fn is not None:
+                    prof = profile_lookup_fn(row['sersic'])
+                    gal_prof_img.append((np.array(prof.amp), np.array(prof.mean), np.array(prof.var)))
+                else:
+                    gal_prof_img.append((np.zeros(1), np.zeros((1, 2)), np.eye(2)[np.newaxis]))
+
+        ps_flux_list.append(ps_flux_img)
+        ps_pos_list.append(ps_pos_img)
+        gal_flux_list.append(gal_flux_img)
+        gal_pos_list.append(gal_pos_img)
+        gal_cd_list.append(gal_cd_img)
+        gal_shape_list.append(gal_shape_img)
+        gal_prof_list.append(gal_prof_img)
+
+    # Stack images
+    images_data = {
+        'data': jnp.stack(data_list),
+        'invvar': jnp.stack(invvar_list),
+        'psf': {
+            'type_code': jnp.zeros(N_img, dtype=jnp.int32),
+            'sampling': jnp.full(N_img, target_sampling, dtype=jnp.float32),
+            'fft': jnp.stack(psf_fft_list),
+            'amp': jnp.zeros((N_img, 1)),
+            'mean': jnp.zeros((N_img, 1, 2)),
+            'var': jnp.tile(jnp.eye(2), (N_img, 1, 1, 1)),
+        }
+    }
+
+    # Build batches
+    batches = {}
+
+    max_ps = max(len(x) for x in ps_flux_list) if ps_flux_list else 0
+    if max_ps > 0:
+        fi_stack, pp_stack, mk_stack = [], [], []
+        for fl, pos in zip(ps_flux_list, ps_pos_list):
+            n = len(fl)
+            pad = max_ps - n
+            fi_stack.append(np.pad(np.array(fl, dtype=np.int32), (0, pad)))
+            p = np.array(pos, dtype=np.float32) if n > 0 else np.zeros((0, 2), dtype=np.float32)
+            pp_stack.append(np.pad(p, ((0, pad), (0, 0))))
+            mk_stack.append(np.pad(np.ones(n, dtype=np.float32), (0, pad)))
+        batches['PointSource'] = {
+            'flux_idx': jnp.array(np.stack(fi_stack)),
+            'pos_pix': jnp.array(np.stack(pp_stack)),
+            'mask': jnp.array(np.stack(mk_stack)),
+        }
+
+    max_gal = max(len(x) for x in gal_flux_list) if gal_flux_list else 0
+    if max_gal > 0:
+        fi_s, pp_s, cd_s, sh_s, mk_s = [], [], [], [], []
+        amp_s, mean_s, var_s = [], [], []
+        for fl, pos, cd, sh, pr in zip(gal_flux_list, gal_pos_list, gal_cd_list, gal_shape_list, gal_prof_list):
+            n = len(fl)
+            pad = max_gal - n
+            fi_s.append(np.pad(np.array(fl, dtype=np.int32), (0, pad)))
+            p = np.array(pos, dtype=np.float32) if n > 0 else np.zeros((0, 2), dtype=np.float32)
+            pp_s.append(np.pad(p, ((0, pad), (0, 0))))
+            c = np.array(cd, dtype=np.float32) if n > 0 else np.zeros((0, 2, 2), dtype=np.float32)
+            cd_s.append(np.pad(c, ((0, pad), (0, 0), (0, 0))))
+            s = np.array(sh, dtype=np.float32) if n > 0 else np.zeros((0, 3), dtype=np.float32)
+            sh_s.append(np.pad(s, ((0, pad), (0, 0))))
+            mk_s.append(np.pad(np.ones(n, dtype=np.float32), (0, pad)))
+
+            img_amp = np.zeros((max_gal, max_gal_mog_K), dtype=np.float32)
+            img_mean = np.zeros((max_gal, max_gal_mog_K, 2), dtype=np.float32)
+            img_var = np.zeros((max_gal, max_gal_mog_K, 2, 2), dtype=np.float32)
+            img_var[:] = np.eye(2)
+            for k in range(n):
+                a, m, v = pr[k]
+                K = len(a)
+                img_amp[k, :K] = a
+                img_mean[k, :K] = m
+                img_var[k, :K] = v
+            amp_s.append(img_amp)
+            mean_s.append(img_mean)
+            var_s.append(img_var)
+
+        batches['Galaxy'] = {
+            'flux_idx': jnp.array(np.stack(fi_s)),
+            'pos_pix': jnp.array(np.stack(pp_s)),
+            'wcs_cd_inv': jnp.array(np.stack(cd_s)),
+            'shapes': jnp.array(np.stack(sh_s)),
+            'mask': jnp.array(np.stack(mk_s)),
+            'profile': {
+                'amp': jnp.array(np.stack(amp_s)),
+                'mean': jnp.array(np.stack(mean_s)),
+                'var': jnp.array(np.stack(var_s)),
+            },
+        }
+
+    src_fluxes_np = np.array(src_fluxes, dtype=np.float32)
+    initial_fluxes_matrix = np.tile(src_fluxes_np, (N_img, 1))
+
+    if fit_background:
+        bg_vals = np.zeros((N_img, 1), dtype=np.float32)
+        initial_fluxes_matrix = np.hstack([initial_fluxes_matrix, bg_vals])
+        bg_idx = len(src_fluxes_np)
+        batches['Background'] = {'flux_idx': jnp.array([bg_idx], dtype=jnp.int32)}
+
+    return images_data, batches, jnp.array(initial_fluxes_matrix, dtype=jnp.float32)
+
+
 def render_batch_point_sources(fluxes, pos_pix, psf_data, img_shape, sampling_factor=None, mask=None):
     """
     Renders a batch of Point Sources.
@@ -1040,9 +1288,163 @@ def compute_fisher_diagonal(image_data, batches, n_flux):
     return fisher_diag
 
 
+def _render_source_templates(image_data, batches, n_flux, sampling_factor=None):
+    """
+    Renders unit-flux template images for every source (and background).
+    Returns a design matrix A of shape (N_flux, H, W).
+    """
+    H, W = image_data['data'].shape
+    psf_data = image_data["psf"]
+    templates = jnp.zeros((n_flux, H, W))
+
+    if "PointSource" in batches:
+        batch = batches["PointSource"]
+        pos_pix = batch["pos_pix"]
+        f_idx = batch["flux_idx"]
+        mask = batch.get("mask", None)
+
+        if sampling_factor is not None:
+            s = sampling_factor
+        else:
+            s = psf_data['sampling']
+
+        H_hr_grid = psf_data['fft'].shape[0]
+        W_hr_grid = (psf_data['fft'].shape[1] - 1) * 2
+
+        def _ps_stamps_fft(op):
+            render_shape = (H_hr_grid, W_hr_grid)
+            pos_scaled = pos_pix * s + (s - 1.0) / 2.0
+            unit = jnp.ones(pos_pix.shape[0])
+            if mask is not None:
+                unit = unit * mask
+            render_fn = vmap(partial(render_point_source_fft, image_shape=render_shape),
+                             in_axes=(0, 0, None))
+            stamps = render_fn(unit, pos_scaled, psf_data['fft'])
+            if sampling_factor is not None and s > 1.001:
+                valid_H = int(round(H * s))
+                valid_W = int(round(W * s))
+                valid_H = min(valid_H, H_hr_grid)
+                valid_W = min(valid_W, W_hr_grid)
+                stamps = stamps[:, :valid_H, :valid_W]
+                ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                stamps = ds_fn(stamps)
+            elif sampling_factor is None:
+                if H_hr_grid > H + 1:
+                    ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                    stamps = ds_fn(stamps)
+            return stamps
+
+        def _ps_stamps_mog(op):
+            psf_mix = (psf_data["amp"], psf_data["mean"], psf_data["var"])
+            unit = jnp.ones(pos_pix.shape[0])
+            if mask is not None:
+                unit = unit * mask
+            render_fn = vmap(partial(render_point_source_mog, image_shape=(H, W)),
+                             in_axes=(0, 0, None))
+            return render_fn(unit, pos_pix, psf_mix)
+
+        ps_stamps = jax.lax.cond(psf_data['type_code'] == 0,
+                                 _ps_stamps_fft, _ps_stamps_mog, None)
+        templates = templates.at[f_idx].add(ps_stamps)
+
+    if "Galaxy" in batches:
+        batch = batches["Galaxy"]
+        pos_pix = batch["pos_pix"]
+        wcs_cd_inv = batch["wcs_cd_inv"]
+        shapes = batch["shapes"]
+        profiles = batch["profile"]
+        f_idx = batch["flux_idx"]
+        mask = batch.get("mask", None)
+
+        if sampling_factor is not None:
+            s = sampling_factor
+        else:
+            s = psf_data['sampling']
+
+        H_hr_grid = psf_data['fft'].shape[0]
+        W_hr_grid = (psf_data['fft'].shape[1] - 1) * 2
+
+        def _gal_stamps_fft(op):
+            render_shape = (H_hr_grid, W_hr_grid)
+            pos_scaled = pos_pix * s + (s - 1.0) / 2.0
+            wcs_scaled = wcs_cd_inv * s
+            gal_mix = (profiles["amp"], profiles["mean"], profiles["var"])
+            render_fn = vmap(partial(render_galaxy_fft, image_shape=render_shape),
+                             in_axes=((0, 0, 0), None, 0, 0, 0))
+            stamps = render_fn(gal_mix, psf_data['fft'], shapes, wcs_scaled, pos_scaled)
+            if sampling_factor is not None and s > 1.001:
+                valid_H = int(round(H * s))
+                valid_W = int(round(W * s))
+                valid_H = min(valid_H, H_hr_grid)
+                valid_W = min(valid_W, W_hr_grid)
+                stamps = stamps[:, :valid_H, :valid_W]
+                ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                stamps = ds_fn(stamps)
+            elif sampling_factor is None:
+                if H_hr_grid > H + 1:
+                    ds_fn = vmap(partial(downsample_image, target_shape=(H, W)))
+                    stamps = ds_fn(stamps)
+            return stamps
+
+        def _gal_stamps_mog(op):
+            psf_mix = (psf_data["amp"], psf_data["mean"], psf_data["var"])
+            gal_mix = (profiles["amp"], profiles["mean"], profiles["var"])
+            render_fn = vmap(partial(render_galaxy_mog, image_shape=(H, W)),
+                             in_axes=((0, 0, 0), None, 0, 0, 0))
+            return render_fn(gal_mix, psf_mix, shapes, wcs_cd_inv, pos_pix)
+
+        gal_stamps = jax.lax.cond(psf_data['type_code'] == 0,
+                                  _gal_stamps_fft, _gal_stamps_mog, None)
+        if mask is not None:
+            gal_stamps = gal_stamps * mask[:, jnp.newaxis, jnp.newaxis]
+        templates = templates.at[f_idx].add(gal_stamps)
+
+    if "Background" in batches:
+        bg_idx = batches["Background"]["flux_idx"][0]
+        templates = templates.at[bg_idx].set(jnp.ones((H, W)))
+
+    return templates
+
+
+def solve_fluxes_linear(initial_fluxes, image_data, batches, return_variances=False,
+                        sampling_factor=None, rcond=1e-12):
+    """
+    Direct linear solve for forced photometry on a SINGLE image.
+    Designed to be vmapped.
+
+    Builds the design matrix A (template per source), then solves
+    the normal equations  (A^T W A) f = A^T W d  via Cholesky/LU.
+    """
+    n_flux = initial_fluxes.shape[0]
+    H, W = image_data['data'].shape
+
+    templates = _render_source_templates(image_data, batches, n_flux,
+                                         sampling_factor=sampling_factor)
+
+    data_flat = image_data["data"].ravel()
+    w_flat = image_data["invvar"].ravel()
+    A = templates.reshape(n_flux, -1).T
+
+    Aw = A * w_flat[:, jnp.newaxis]
+    AtWA = Aw.T @ A
+    AtWd = Aw.T @ data_flat
+
+    reg = rcond * jnp.trace(AtWA) / n_flux
+    AtWA_reg = AtWA + reg * jnp.eye(n_flux)
+
+    optimized_fluxes = jnp.linalg.solve(AtWA_reg, AtWd)
+
+    if return_variances:
+        cov = jnp.linalg.inv(AtWA_reg)
+        variances = jnp.diag(cov)
+        return optimized_fluxes, variances
+
+    return optimized_fluxes
+
+
 def solve_fluxes_core(initial_fluxes, image_data, batches, return_variances=False, sampling_factor=None, use_preconditioner=True, precond_eps=1e-12):
     """
-    Pure JAX core optimization logic for a SINGLE image.
+    Pure JAX core optimization logic for a SINGLE image (Newton-CG).
     Designed to be vmapped.
 
     Args:
@@ -1060,7 +1462,6 @@ def solve_fluxes_core(initial_fluxes, image_data, batches, return_variances=Fals
         chi2 = jnp.sum(diff**2 * invvar)
         return chi2
 
-    # Use Matrix-Free Newton-CG for linear least squares.
     grad_fn = jax.grad(loss_fn)
     grads = grad_fn(initial_fluxes)
 
@@ -1074,9 +1475,6 @@ def solve_fluxes_core(initial_fluxes, image_data, batches, return_variances=Fals
         fisher_diag = jnp.where(fisher_diag <= 0, precond_eps, fisher_diag)
         inv_fisher_diag = 1.0 / fisher_diag
 
-    # CG solve A x = b where A is Hessian, b = -grads
-    # For high precision, maxiter needs to be higher?
-    # User requested dchi2=1e-10.
     if use_preconditioner:
         def precond(v):
             return v * inv_fisher_diag
@@ -1095,10 +1493,9 @@ def solve_fluxes_core(initial_fluxes, image_data, batches, return_variances=Fals
     return optimized_fluxes
 
 
-def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=False, fit_background=False, update_catalog=False, vmap_images=True, use_sharding=True, bucket_sizes=None, bucket_mode="auto", bucket_shape_mode="square", bucket_base=32, use_tiling=False, tile_size=256, tile_super_halo=None, use_preconditioner=True, precond_eps=1e-12):
+def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=False, fit_background=False, update_catalog=False, vmap_images=True, use_sharding=True, bucket_sizes=None, bucket_mode="auto", bucket_shape_mode="square", bucket_base=32, use_tiling=False, tile_size=256, tile_super_halo=None, use_preconditioner=True, precond_eps=1e-12, solver="linear"):
     """
     Optimizes fluxes for forced photometry using JAX.
-    Iterates over images in tractor_obj and fits each one separately using vectorized execution (vmap).
 
     Args:
         tractor_obj: Tractor object with images and catalog.
@@ -1106,38 +1503,38 @@ def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=Fa
         return_variances: bool, if True, return variances of fluxes.
         fit_background: bool, if True, includes background level in optimization parameters.
         update_catalog: bool, if True, updates the source catalog with optimized fluxes.
-                        Requires single image or warns if multiple.
         vmap_images: bool, if True (default), stacks all images and processes them in a single vmap call.
-                     If False, iterates over images sequentially (saving memory).
-        use_sharding: bool, if True (default), distributes the batch across available devices when vmap_images=True.
-        bucket_sizes: List of bucket sizes (e.g. [128, 256]). Used if bucket_mode="fixed".
+        use_sharding: bool, if True (default), distributes the batch across available devices.
+        bucket_sizes: List of bucket sizes. Used if bucket_mode="fixed".
         bucket_mode: "auto" or "fixed".
         bucket_shape_mode: "square" or "independent".
         bucket_base: rounding base for auto mode.
         use_tiling: bool, if True, splits images into tiles and processes them.
         tile_size: int, size of tiles (default 256).
         tile_super_halo: optional int, override calculated halo size.
-        use_preconditioner: bool, if True (default), use Fisher diagonal preconditioner.
+        use_preconditioner: bool, if True (default), use Fisher diagonal preconditioner (CG only).
         precond_eps: float, floor for Fisher diagonal to avoid divide-by-zero.
+        solver: "linear" (direct normal-equations solve) or "cg" (Newton-CG, original).
 
     Returns:
         List of results per image.
-        Each result is (fluxes, variances) if return_variances is True, else fluxes.
-        Note: The tractor_obj source catalog is NOT updated unless update_catalog=True.
-        However, if fit_background is True, img.sky is updated for each image.
     """
     from tractor import ConstantSky
 
     results = []
 
-    # Common function to compile/call solve_fluxes_core
-    # We can use JIT here regardless of vmap
-    solve_jit = jit(partial(
-        solve_fluxes_core,
-        return_variances=return_variances,
-        use_preconditioner=use_preconditioner,
-        precond_eps=precond_eps,
-    ))
+    _solver_fn = solve_fluxes_linear if solver == "linear" else solve_fluxes_core
+
+    if solver == "linear":
+        _solver_kwargs = dict(return_variances=return_variances)
+    else:
+        _solver_kwargs = dict(
+            return_variances=return_variances,
+            use_preconditioner=use_preconditioner,
+            precond_eps=precond_eps,
+        )
+
+    solve_jit = jit(partial(_solver_fn, **_solver_kwargs))
 
     if use_tiling:
         # TILING MODE
@@ -1257,11 +1654,9 @@ def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=Fa
 
             solve_fn = jit(vmap(
                 partial(
-                    solve_fluxes_core,
-                    return_variances=return_variances,
+                    _solver_fn,
+                    **_solver_kwargs,
                     sampling_factor=max_factor,
-                    use_preconditioner=use_preconditioner,
-                    precond_eps=precond_eps,
                 ),
                 in_axes=(0, 0, batches_in_axes)
             ))
@@ -1367,14 +1762,11 @@ def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=Fa
             if use_sharding:
                 images_data, batches, initial_fluxes = prepare_sharded_inputs(images_data, batches, initial_fluxes)
 
-            # Re-compile for this shape
             solve_fn = jit(vmap(
                 partial(
-                    solve_fluxes_core,
-                    return_variances=return_variances,
+                    _solver_fn,
+                    **_solver_kwargs,
                     sampling_factor=max_factor,
-                    use_preconditioner=use_preconditioner,
-                    precond_eps=precond_eps,
                 ),
                 in_axes=(0, 0, batches_in_axes)
             ))
@@ -1547,8 +1939,10 @@ def optimize_fluxes(tractor_obj, oversample_rendering=False, return_variances=Fa
 
 
 class JaxOptimizer(Optimizer):
-    def __init__(self):
+    def __init__(self, enable_x64=False):
         super(JaxOptimizer, self).__init__()
+        if enable_x64:
+            jax.config.update("jax_enable_x64", True)
 
     def optimize(self, tractor, alphas=None, damp=0, priors=True,
                  scale_columns=True, shared_params=True, variance=False,
