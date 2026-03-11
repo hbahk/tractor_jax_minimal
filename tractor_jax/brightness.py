@@ -1,5 +1,5 @@
 import numpy as np
-from tractor.utils import ScalarParam, ParamList, BaseParams, getClassName
+from tractor_jax.utils import ScalarParam, ParamList, BaseParams, getClassName
 from tractor import ducks
 
 

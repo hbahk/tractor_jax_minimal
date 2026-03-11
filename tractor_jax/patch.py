@@ -250,7 +250,7 @@ class Patch(object):
         return self.y0
 
     def clipTo(self, W, H, use_gpu=False):
-        from tractor.miscutils import get_overlapping_region
+        from tractor_jax.miscutils import get_overlapping_region
         if self.patch is None:
             return False
         if self.x0 >= W:
@@ -337,7 +337,7 @@ class Patch(object):
         Returns (spatch, sparent), slices that yield the overlapping regions
         in this Patch and the given image.
         '''
-        from tractor.miscutils import get_overlapping_region
+        from tractor_jax.miscutils import get_overlapping_region
         (ph, pw) = self.shape
         (ih, iw) = shape
         (outx, inx) = get_overlapping_region(
@@ -371,7 +371,7 @@ class Patch(object):
     plotnum = 0
 
     def addTo(self, img, scale=1.):
-        from tractor.miscutils import get_overlapping_region
+        from tractor_jax.miscutils import get_overlapping_region
         if self.patch is None:
             return img
         (ih, iw) = img.shape

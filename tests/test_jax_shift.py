@@ -3,11 +3,11 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tractor import Tractor, Image, PointSource, NullWCS, ConstantSky
-from tractor.brightness import Flux
-from tractor.wcs import PixPos
-from tractor.psf import PixelizedPSF
-from tractor.jax.optimizer import extract_model_data, render_image
+from tractor_jax import Tractor, Image, PointSource, NullWCS, ConstantSky
+from tractor_jax.brightness import Flux
+from tractor_jax.wcs import PixPos
+from tractor_jax.psf import PixelizedPSF
+from tractor_jax.jax.optimizer import extract_model_data, render_image
 
 class TestJaxShift(unittest.TestCase):
     def test_shift_precision(self):

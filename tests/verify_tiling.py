@@ -1,12 +1,12 @@
 import numpy as np
 import jax
-from tractor.jax.optimizer import optimize_fluxes
-from tractor.engine import Tractor
-from tractor.image import Image
-from tractor.pointsource import PointSource
-from tractor.wcs import NullWCS, PixPos
-from tractor.brightness import Flux
-from tractor.psf import PixelizedPSF
+from tractor_jax.jax.optimizer import optimize_fluxes
+from tractor_jax.engine import Tractor
+from tractor_jax.image import Image
+from tractor_jax.pointsource import PointSource
+from tractor_jax.wcs import NullWCS, PixPos
+from tractor_jax.brightness import Flux
+from tractor_jax.psf import PixelizedPSF
 
 def test_tiling_optimization():
     print("Testing tiling optimization...")

@@ -7,7 +7,7 @@ from utils import get_nearest_psf_zone_index
 
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
-from tractor.jax.rendering import (
+from tractor_jax.jax.rendering import (
     render_point_source_fft,
     render_pixelized_psf,
     rebin_downsample_int_flux,

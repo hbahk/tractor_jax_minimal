@@ -13,15 +13,15 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
-from tractor.brightness import Flux
-from tractor.wcs import PixPos, AstropyWCS, RaDecPos
-from tractor.jax.optimizer import JaxOptimizer, extract_model_data, render_image
-from tractor.psf import PixelizedPSF
-import tractor
-from tractor import ConstantSky, Flux, LinearPhotoCal, NullWCS, PixPos, PointSource, RaDecPos
-from tractor.galaxy import GalaxyShape
-from tractor.sersic import SersicIndex, SersicGalaxy, SersicMixture
+from tractor_jax import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
+from tractor_jax.brightness import Flux
+from tractor_jax.wcs import PixPos, AstropyWCS, RaDecPos
+from tractor_jax.jax.optimizer import JaxOptimizer, extract_model_data, render_image
+from tractor_jax.psf import PixelizedPSF
+import tractor_jax
+from tractor_jax import ConstantSky, Flux, LinearPhotoCal, NullWCS, PixPos, PointSource, RaDecPos
+from tractor_jax.galaxy import GalaxyShape
+from tractor_jax.sersic import SersicIndex, SersicGalaxy, SersicMixture
 from tqdm import tqdm, trange
 from utils import get_nearest_psf_zone_index, sky_pa_to_pixel_pa, SPHERExSersicGalaxy
 THAW_SHAPE = False

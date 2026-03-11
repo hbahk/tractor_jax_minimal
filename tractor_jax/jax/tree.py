@@ -1,13 +1,13 @@
 import jax
-from tractor.engine import Tractor, Images, Catalog
-from tractor.image import Image
-from tractor.pointsource import PointSource
-from tractor.sky import ConstantSky, NullSky
-from tractor.wcs import NullWCS, PixPos, RaDecPos, AffineWCS
-from tractor.psf import PixelizedPSF, GaussianMixturePSF
-from tractor.utils import MogParams, ScalarParam, ParamList
-from tractor.brightness import Flux, LinearPhotoCal, NullPhotoCal
-from tractor.galaxy import JaxGalaxy, GalaxyShape
+from tractor_jax.engine import Tractor, Images, Catalog
+from tractor_jax.image import Image
+from tractor_jax.pointsource import PointSource
+from tractor_jax.sky import ConstantSky, NullSky
+from tractor_jax.wcs import NullWCS, PixPos, RaDecPos, AffineWCS
+from tractor_jax.psf import PixelizedPSF, GaussianMixturePSF
+from tractor_jax.utils import MogParams, ScalarParam, ParamList
+from tractor_jax.brightness import Flux, LinearPhotoCal, NullPhotoCal
+from tractor_jax.galaxy import JaxGalaxy, GalaxyShape
 
 class MogProfile:
     def __init__(self, amp, mean, var):

@@ -9,18 +9,18 @@ from functools import partial
 from collections import defaultdict, Counter
 import jax.image
 
-from tractor.engine import Tractor
-from tractor.optimize import Optimizer
-from tractor.pointsource import PointSource
-from tractor.galaxy import (
+from tractor_jax.engine import Tractor
+from tractor_jax.optimize import Optimizer
+from tractor_jax.pointsource import PointSource
+from tractor_jax.galaxy import (
     Galaxy,
     ExpGalaxy,
     DevGalaxy,
     CompositeGalaxy,
     FixedCompositeGalaxy,
 )
-from tractor.psf import PixelizedPSF, GaussianMixturePSF
-from tractor.jax.rendering import (
+from tractor_jax.psf import PixelizedPSF, GaussianMixturePSF
+from tractor_jax.jax.rendering import (
     render_pixelized_psf,
     render_galaxy_fft,
     render_point_source_pixelized,
@@ -29,7 +29,7 @@ from tractor.jax.rendering import (
     render_point_source_fft,
     downsample_image,
 )
-from tractor.jax.tiling import tile_image, project_catalog, filter_sources_by_box
+from tractor_jax.jax.tiling import tile_image, project_catalog, filter_sources_by_box
 
 
 def compute_image_shapes(images, stats):

@@ -4,12 +4,12 @@ if __name__ == '__main__':
     matplotlib.use('Agg')
     import pylab as plt
     from astrometry.util.plotutils import *
-    from tractor.galaxy import *
+    from tractor_jax.galaxy import *
 
 import math
 import numpy as np
 
-from tractor.utils import ParamList
+from tractor_jax.utils import ParamList
 
 
 class EllipseE(ParamList):
@@ -355,7 +355,7 @@ if __name__ == '__main__':
     plt.title('EllipseE')
     ps.savefig()
 
-    from tractor.psf import NCircularGaussianPSF
+    from tractor_jax.psf import NCircularGaussianPSF
     from tractor import Image, NullWCS, ConstantSky, LinearPhotoCal, PixPos, Flux, Tractor
     W, H = 500, 500
     img = np.zeros((H, W), np.float32)

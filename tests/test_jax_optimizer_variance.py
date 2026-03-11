@@ -1,11 +1,11 @@
 
 import numpy as np
 import jax.numpy as jnp
-from tractor.jax.optimizer import optimize_fluxes
-from tractor.pointsource import PointSource
-from tractor.brightness import Flux
-from tractor.psf import GaussianMixturePSF
-from tractor.mixture_profiles import MixtureOfGaussians
+from tractor_jax.jax.optimizer import optimize_fluxes
+from tractor_jax.pointsource import PointSource
+from tractor_jax.brightness import Flux
+from tractor_jax.psf import GaussianMixturePSF
+from tractor_jax.mixture_profiles import MixtureOfGaussians
 
 # Mock classes
 class MockImage:

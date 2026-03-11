@@ -16,10 +16,10 @@ if __name__ == '__main__':
 import numpy as np
 
 from tractor import mixture_profiles as mp
-from tractor.engine import *
-from tractor.utils import *
-from tractor.cache import *
-from tractor.galaxy import *
+from tractor_jax.engine import *
+from tractor_jax.utils import *
+from tractor_jax.cache import *
+from tractor_jax.galaxy import *
 
 class SersicMixture(object):
     singleton = None
@@ -507,7 +507,7 @@ if __name__ == '__main__':
     # plt.savefig('serfits.png')
 
     import galsim
-    from tractor.psf import *
+    from tractor_jax.psf import *
     
     H,W = 100,100
 
@@ -586,7 +586,7 @@ if __name__ == '__main__':
                     psf=GaussianMixturePSF(1., 0., 0., 4., 4., 0.))
         tim = img
 
-        from tractor.constrained_optimizer import ConstrainedOptimizer
+        from tractor_jax.constrained_optimizer import ConstrainedOptimizer
 
         for i,si in enumerate(sersics):
             pixel_scale = 1.0
@@ -670,7 +670,7 @@ if __name__ == '__main__':
                     ax1.plot(v + np.zeros_like(amps), amps, 'o', mec='r', mfc='none', ms=5)
                     ax2.plot(v + np.zeros_like(vars), vars, 'o', mec='r', mfc='none', ms=5)
 
-        from tractor.mixture_profiles import dev_amp,dev_var,exp_amp,exp_var
+        from tractor_jax.mixture_profiles import dev_amp,dev_var,exp_amp,exp_var
         ax1.plot([4.]*len(dev_amp), dev_amp, 'o', mec='b', mfc='none', ms=5)
         ax2.plot([4.]*len(dev_var), dev_var, 'o', mec='b', mfc='none', ms=5)
         ax1.plot([1.]*len(exp_amp), exp_amp, 'o', mec='b', mfc='none', ms=5)

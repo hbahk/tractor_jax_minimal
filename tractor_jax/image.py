@@ -1,5 +1,5 @@
 import numpy as np
-from tractor.utils import MultiParams, _isint, listmax, get_class_from_name
+from tractor_jax.utils import MultiParams, _isint, listmax, get_class_from_name
 import traceback
 
 class Image(MultiParams):
@@ -44,13 +44,13 @@ class Image(MultiParams):
 
         # Fill in defaults, if necessary.
         if wcs is None:
-            from tractor.basics import NullWCS
+            from tractor_jax.basics import NullWCS
             wcs = NullWCS()
         if sky is None:
-            from tractor.basics import NullSky
+            from tractor_jax.basics import NullSky
             sky = NullSky()
         if photocal is None:
-            from tractor.basics import NullPhotoCal
+            from tractor_jax.basics import NullPhotoCal
             photocal = NullPhotoCal()
 
         # acceptable approximation level when rendering this model

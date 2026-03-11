@@ -3,11 +3,11 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
-from tractor import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
-from tractor.brightness import Flux
-from tractor.wcs import PixPos
-from tractor.jax.optimizer import JaxOptimizer, extract_model_data, render_image
-from tractor.psf import PixelizedPSF
+from tractor_jax import Tractor, Image, PointSource, Catalog, NullWCS, ConstantSky
+from tractor_jax.brightness import Flux
+from tractor_jax.wcs import PixPos
+from tractor_jax.jax.optimizer import JaxOptimizer, extract_model_data, render_image
+from tractor_jax.psf import PixelizedPSF
 
 def test_jax_optimizer_accuracy():
     # Setup

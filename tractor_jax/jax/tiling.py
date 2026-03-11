@@ -1,6 +1,6 @@
 import numpy as np
 import math
-from tractor.image import Image
+from tractor_jax.image import Image
 from tractor import ConstantSky
 
 def tile_image(image, tile_size, halo):

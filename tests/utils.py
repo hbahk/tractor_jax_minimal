@@ -7,8 +7,8 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 from astropy.utils.data import conf
 from scipy.interpolate import InterpolatedUnivariateSpline
-from tractor import mixture_profiles as mp
-from tractor.sersic import SersicMixture, SersicGalaxy
+from tractor_jax import mixture_profiles as mp
+from tractor_jax.sersic import SersicMixture, SersicGalaxy
 
 XX, YY = np.meshgrid(np.arange(11), np.arange(11))
 ZXGRID = XX.flatten() + 1

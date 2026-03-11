@@ -13,10 +13,10 @@ import logging
 
 import numpy as np
 
-from tractor.utils import MultiParams, _isint, get_class_from_name
-from tractor.patch import Patch, ModelMask
-from tractor.image import Image
-from tractor.utils import savetxt_cpu_append
+from tractor_jax.utils import MultiParams, _isint, get_class_from_name
+from tractor_jax.patch import Patch, ModelMask
+from tractor_jax.image import Image
+from tractor_jax.utils import savetxt_cpu_append
 
 import time
 

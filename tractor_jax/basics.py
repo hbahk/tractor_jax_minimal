@@ -13,21 +13,21 @@ Magnitudes, (RA,Dec) positions, FITS WCS, and so on.
 
 import numpy as np
 
-from tractor.image import Image
-from tractor.patch import Patch
-from tractor.utils import MultiParams
+from tractor_jax.image import Image
+from tractor_jax.patch import Patch
+from tractor_jax.utils import MultiParams
 from tractor import mixture_profiles as mp
 
-from tractor.tractortime import TAITime
-from tractor.psf import (PixelizedPSF, GaussianMixturePSF,
+from tractor_jax.tractortime import TAITime
+from tractor_jax.psf import (PixelizedPSF, GaussianMixturePSF,
                          GaussianMixtureEllipsePSF, NCircularGaussianPSF)
-from tractor.wcs import (NullWCS, PixPos, RaDecPos)
-from tractor.sky import NullSky, ConstantSky
-from tractor.brightness import (Mag, Flux, Mags, Fluxes, NanoMaggies,
+from tractor_jax.wcs import (NullWCS, PixPos, RaDecPos)
+from tractor_jax.sky import NullSky, ConstantSky
+from tractor_jax.brightness import (Mag, Flux, Mags, Fluxes, NanoMaggies,
                                 FluxesPhotoCal, MagsPhotoCal, NullPhotoCal,
                                 LinearPhotoCal)
-from tractor.pointsource import BasicSource, SingleProfileSource, PointSource
-from tractor.shifted import (ParamsWrapper, ShiftedPsf, ScaledPhotoCal,
+from tractor_jax.pointsource import BasicSource, SingleProfileSource, PointSource
+from tractor_jax.shifted import (ParamsWrapper, ShiftedPsf, ScaledPhotoCal,
                              ScaledWcs, ShiftedWcs)
 
 

@@ -1,7 +1,7 @@
 from __future__ import print_function
 import numpy as np
 
-from tractor.utils import BaseParams, ParamList, MultiParams, ArithmeticParams
+from tractor_jax.utils import BaseParams, ParamList, MultiParams, ArithmeticParams
 from tractor import ducks
 
 try:

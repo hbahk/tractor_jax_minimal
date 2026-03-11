@@ -1,8 +1,8 @@
 from __future__ import print_function
 import numpy as np
 
-from tractor.utils import MultiParams
-from tractor.patch import ModelMask
+from tractor_jax.utils import MultiParams
+from tractor_jax.patch import ModelMask
 from tractor import ducks
 
 ct1 = np.zeros(2,dtype=np.int32)

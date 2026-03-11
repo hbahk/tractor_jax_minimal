@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import jax.numpy.fft as jfft
 import matplotlib.pyplot as plt
 import numpy as np
-from tractor.jax.rendering import render_point_source_fft
+from tractor_jax.jax.rendering import render_point_source_fft
 
 def create_gaussian_psf(shape, sigma):
     """Creates a simple Gaussian PSF kernel."""

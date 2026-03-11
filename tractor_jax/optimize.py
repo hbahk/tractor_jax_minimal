@@ -1,7 +1,7 @@
 from __future__ import print_function
 import numpy as np
-from tractor.tractortime import TAITime as Time
-from tractor.engine import logverb, OptResult, logmsg
+from tractor_jax.tractortime import TAITime as Time
+from tractor_jax.engine import logverb, OptResult, logmsg
 
 
 class Optimizer(object):
@@ -32,7 +32,7 @@ class Optimizer(object):
                           negfluxval=None,
                           **kwargs
                           ):
-        from tractor.basics import LinearPhotoCal, ShiftedWcs
+        from tractor_jax.basics import LinearPhotoCal, ShiftedWcs
 
         result = OptResult()
 
@@ -69,7 +69,7 @@ class Optimizer(object):
         subimgs = []
         if rois is not None:
             for i, img in enumerate(imgs):
-                from tractor.image import Image
+                from tractor_jax.image import Image
                 roi = rois[i]
                 y0 = roi[0].start
                 x0 = roi[1].start

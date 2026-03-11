@@ -2,14 +2,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import unittest
-from tractor import Tractor, Image, Catalog
-from tractor.basics import NullWCS, ConstantSky
-from tractor.pointsource import PointSource
-from tractor.brightness import Flux
-from tractor.wcs import RaDecPos
-from tractor.psf import PixelizedPSF
-from tractor.jax.optimizer import optimize_fluxes, JaxOptimizer
-import tractor.jax.optimizer as jax_opt
+from tractor_jax import Tractor, Image, Catalog
+from tractor_jax.basics import NullWCS, ConstantSky
+from tractor_jax.pointsource import PointSource
+from tractor_jax.brightness import Flux
+from tractor_jax.wcs import RaDecPos
+from tractor_jax.psf import PixelizedPSF
+from tractor_jax.jax.optimizer import optimize_fluxes, JaxOptimizer
+import tractor_jax.jax.optimizer as jax_opt
 
 class TestJaxBucketing(unittest.TestCase):
     def setUp(self):
@@ -48,7 +48,7 @@ class TestJaxBucketing(unittest.TestCase):
         # It assumes pos has .x and .y!
         # So I should use PixPos, not RaDecPos for NullWCS.
 
-        from tractor.basics import PixPos
+        from tractor_jax.basics import PixPos
         src = PointSource(PixPos(32.0, 32.0), Flux(100.0))
 
         self.catalog.append(src)

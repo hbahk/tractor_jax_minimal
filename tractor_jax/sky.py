@@ -1,5 +1,5 @@
-from tractor.utils import BaseParams, ScalarParam
-from tractor.patch import Patch
+from tractor_jax.utils import BaseParams, ScalarParam
+from tractor_jax.patch import Patch
 from tractor import ducks
 
 

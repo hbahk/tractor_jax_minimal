@@ -8,7 +8,7 @@ from astropy.table import Table
 from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 
-from tractor.jax.optimizer import extract_model_data, solve_fluxes_core, render_image
+from tractor_jax.jax.optimizer import extract_model_data, solve_fluxes_core, render_image
 
 from tests.test_jax_optimizer_spherex_batch import (
     FLAG_BITS,

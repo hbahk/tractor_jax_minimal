@@ -6,16 +6,16 @@ import functools
 
 import numpy as np
 
-from tractor.image import Image
-from tractor.pointsource import PointSource
-from tractor.wcs import PixPos
-from tractor.brightness import Flux
-from tractor.engine import Tractor
-from tractor.patch import Patch
-from tractor.utils import BaseParams, ParamList, MultiParams, MogParams
+from tractor_jax.image import Image
+from tractor_jax.pointsource import PointSource
+from tractor_jax.wcs import PixPos
+from tractor_jax.brightness import Flux
+from tractor_jax.engine import Tractor
+from tractor_jax.patch import Patch
+from tractor_jax.utils import BaseParams, ParamList, MultiParams, MogParams
 from tractor import mixture_profiles as mp
 from tractor import ducks
-from tractor.utils import savetxt_cpu_append
+from tractor_jax.utils import savetxt_cpu_append
 
 if sys.version_info[0] == 2:
     # Py2
@@ -38,7 +38,7 @@ def lanczos_shift_image(img, dx, dy, inplace=False, force_python=False):
         or H > work_corr7f.shape[0] or W > work_corr7f.shape[1]):
         # fallback to python:
         from scipy.ndimage import correlate1d
-        from tractor.miscutils import lanczos_filter
+        from tractor_jax.miscutils import lanczos_filter
         L = 3
         Lx = lanczos_filter(L, np.arange(-L, L+1) + dx)
         Ly = lanczos_filter(L, np.arange(-L, L+1) + dy)
@@ -60,9 +60,9 @@ def lanczos_shift_image(img, dx, dy, inplace=False, force_python=False):
 
 def lanczos_shift_image_batch_gpu(imgs, dxs, dys):
     """Translated from lanczos_shift_image python version to GPU using cupy
-        and helper functions from tractor.miscutils"""
+        and helper functions from tractor_jax.miscutils"""
     import jax.numpy as jnp
-    from tractor.miscutils import lanczos_filter, batch_correlate1d
+    from tractor_jax.miscutils import lanczos_filter, batch_correlate1d
     L = 3
     nimg = dxs.size 
     lr = jnp.tile(jnp.arange(-L, L+1), (nimg, 1))
@@ -223,7 +223,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
                                                         modelMask=modelMask,
                                                         radius=radius, **kwargs)
 
-        from tractor.miscutils import get_overlapping_region
+        from tractor_jax.miscutils import get_overlapping_region
 
         # get PSF image at desired pixel location
         img = self.getImage(px, py)
@@ -364,7 +364,7 @@ class PixelizedPSF(BaseParams, ducks.ImageCalibration):
 
     def _sampleImage(self, img, dx, dy,
                      xlo=None, ylo=None, width=None, height=None):
-        from tractor.miscutils import lanczos3_interpolate_grid
+        from tractor_jax.miscutils import lanczos3_interpolate_grid
         if img is None:
             img = self.img
         if xlo is None:
@@ -749,8 +749,8 @@ class GaussianMixturePSF(MogParams, ducks.ImageCalibration):
 
         optional xy0 = int x0,y0 origin of stamp.
         '''
-        from tractor.emfit import em_fit_2d_reg
-        from tractor.fitpsf import em_init_params
+        from tractor_jax.emfit import em_fit_2d_reg
+        from tractor_jax.fitpsf import em_init_params
         if P0 is not None:
             w, mu, var = P0
         else:
@@ -780,7 +780,7 @@ class GaussianMixturePSF(MogParams, ducks.ImageCalibration):
             return tpsf
 
         elif v2:
-            from tractor.emfit import em_fit_2d_reg2
+            from tractor_jax.emfit import em_fit_2d_reg2
             print('stamp sum:', np.sum(stamp))
             #stamp *= 1000.
             ok, skyamp = em_fit_2d_reg2(stamp, xm, ym, w, mu, var, alpha,
@@ -880,7 +880,7 @@ class GaussianMixtureEllipsePSF(GaussianMixturePSF):
         if len(args) == 3:
             amp, mean, ell = args
         else:
-            from tractor.ellipses import EllipseESoft
+            from tractor_jax.ellipses import EllipseESoft
             assert(len(args) % 6 == 0)
             K = len(args) // 6
             amp = np.array(args[:K])
@@ -964,7 +964,7 @@ class GaussianMixtureEllipsePSF(GaussianMixturePSF):
 
         (parameters of a GaussianMixtureEllipsePSF)
         '''
-        from tractor.ellipses import EllipseESoft
+        from tractor_jax.ellipses import EllipseESoft
         w = np.ones(N) / float(N)
         mu = np.zeros((N, 2))
         ell = [EllipseESoft(np.log(2 * r), 0., 0.) for r in range(1, N + 1)]

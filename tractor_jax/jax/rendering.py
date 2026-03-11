@@ -4,7 +4,7 @@ import jax.numpy.fft as jfft
 import jax.image
 from jax import vmap
 
-from tractor.miscutils import lanczos_filter, batch_correlate1d
+from tractor_jax.miscutils import lanczos_filter, batch_correlate1d
 
 
 def rebin_downsample_int_flux(img: jnp.ndarray, k_y: int, k_x: int) -> jnp.ndarray:

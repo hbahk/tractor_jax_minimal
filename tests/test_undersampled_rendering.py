@@ -3,10 +3,10 @@ import unittest
 import numpy as np
 import jax
 import jax.numpy as jnp
-from tractor import Tractor, Image, Catalog, PointSource, PixelizedPSF, GaussianMixturePSF, ConstantSky, Flux, NullWCS, PixPos
-from tractor.galaxy import ExpGalaxy, GalaxyShape, JaxGalaxy
-from tractor.jax.optimizer import extract_model_data, optimize_fluxes, render_image
-from tractor import mixture_profiles as mp
+from tractor_jax import Tractor, Image, Catalog, PointSource, PixelizedPSF, GaussianMixturePSF, ConstantSky, Flux, NullWCS, PixPos
+from tractor_jax.galaxy import ExpGalaxy, GalaxyShape, JaxGalaxy
+from tractor_jax.jax.optimizer import extract_model_data, optimize_fluxes, render_image
+from tractor_jax import mixture_profiles as mp
 
 class TestUndersampledRendering(unittest.TestCase):
     def test_anisotropic_undersampled(self):

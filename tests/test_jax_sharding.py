@@ -2,11 +2,11 @@ import unittest
 import jax
 import jax.numpy as jnp
 import numpy as np
-from tractor import Tractor, Image, PointSource, NullWCS, ConstantSky
-from tractor.brightness import Flux
-from tractor.wcs import PixPos
-from tractor.psf import PixelizedPSF
-from tractor.jax.optimizer import optimize_fluxes
+from tractor_jax import Tractor, Image, PointSource, NullWCS, ConstantSky
+from tractor_jax.brightness import Flux
+from tractor_jax.wcs import PixPos
+from tractor_jax.psf import PixelizedPSF
+from tractor_jax.jax.optimizer import optimize_fluxes
 
 class TestJaxSharding(unittest.TestCase):
     def test_sharding_execution(self):

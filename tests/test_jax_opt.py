@@ -1,12 +1,12 @@
 import unittest
 import numpy as np
 import jax.numpy as jnp
-from tractor.jax_optimize import optimize_batch, render_model
-from tractor.image import Image
-from tractor.pointsource import PointSource
-from tractor.wcs import PixPos
-from tractor.brightness import Flux
-from tractor.psf import GaussianMixturePSF
+from tractor_jax.jax_optimize import optimize_batch, render_model
+from tractor_jax.image import Image
+from tractor_jax.pointsource import PointSource
+from tractor_jax.wcs import PixPos
+from tractor_jax.brightness import Flux
+from tractor_jax.psf import GaussianMixturePSF
 
 class TestJaxOptimize(unittest.TestCase):
     def test_optimization_two_sources(self):

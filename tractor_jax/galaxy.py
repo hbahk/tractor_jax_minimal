@@ -15,11 +15,11 @@ of these.
 import numpy as np
 
 from tractor import mixture_profiles as mp
-from tractor.utils import ParamList, MultiParams, ScalarParam, BaseParams
-from tractor.patch import Patch, add_patches, ModelMask
-from tractor.basics import SingleProfileSource, BasicSource
+from tractor_jax.utils import ParamList, MultiParams, ScalarParam, BaseParams
+from tractor_jax.patch import Patch, add_patches, ModelMask
+from tractor_jax.basics import SingleProfileSource, BasicSource
 import time
-#from tractor.utils import savetxt_cpu_append
+#from tractor_jax.utils import savetxt_cpu_append
 
 debug_ps = None
 
@@ -303,7 +303,7 @@ class ProfileGalaxy(object):
                                    outer_real_nsigma = 4.,
                                    force_halfsize=None,
                                    **kwargs):
-        from tractor.miscutils import get_overlapping_region
+        from tractor_jax.miscutils import get_overlapping_region
         if modelMask is not None:
             x0, y0 = modelMask.x0, modelMask.y0
         else:
@@ -335,7 +335,7 @@ class ProfileGalaxy(object):
 
         # The "HybridPSF" class is just a marker to indicate whether this
         # code should treat the PSF as a hybrid.
-        from tractor.psf import HybridPSF
+        from tractor_jax.psf import HybridPSF
         hybrid = isinstance(psf, HybridPSF)
 
         def run_mog(amix=None, mm=None):
@@ -562,7 +562,7 @@ class ProfileGalaxy(object):
 
             # Lanczos-3 interpolation in ~the same way we do for
             # pixelized PSFs.
-            from tractor.psf import lanczos_shift_image
+            from tractor_jax.psf import lanczos_shift_image
             G = G.astype(np.float32)
             #savetxt_cpu_append('cg.txt', G)
             if mux != 0.0 or muy != 0.0:
